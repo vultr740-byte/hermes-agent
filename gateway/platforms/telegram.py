@@ -703,15 +703,26 @@ class TelegramAdapter(BasePlatformAdapter):
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
             }
 
+            proxy_url = resolve_proxy_url("TELEGRAM_PROXY")
+            fallback_mode = os.getenv("TELEGRAM_FALLBACK_MODE", "auto").strip().lower()
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in ("1", "true", "yes", "on"))
             fallback_ips = self._fallback_ips()
-            if not fallback_ips:
+            if fallback_mode not in ("auto", "off"):
+                logger.warning(
+                    "[%s] Unsupported TELEGRAM_FALLBACK_MODE=%r. Supported values: auto, off. Falling back to auto.",
+                    self.name,
+                    fallback_mode,
+                )
+                fallback_mode = "auto"
+            if fallback_mode == "auto" and not fallback_ips:
                 fallback_ips = await discover_fallback_ips()
                 logger.info(
                     "[%s] Auto-discovered Telegram fallback IPs: %s",
                     self.name,
                     ", ".join(fallback_ips),
                 )
+            if fallback_mode == "off":
+                fallback_ips = []
 
             proxy_targets = ["api.telegram.org", *fallback_ips]
             proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
@@ -737,7 +748,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 get_updates_request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
             else:
                 if disable_fallback:
-                    logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
+                    if fallback_mode == "off":
+                        logger.info("[%s] Telegram fallback transport disabled via TELEGRAM_FALLBACK_MODE=off", self.name)
+                    else:
+                        logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs)
                 get_updates_request = HTTPXRequest(**request_kwargs)
 

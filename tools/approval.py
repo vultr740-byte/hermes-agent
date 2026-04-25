@@ -732,10 +732,9 @@ def check_all_command_guards(command: str, env_type: str,
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # Explicit YOLO bypass still wins everywhere, including cron sessions.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
-    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
+    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
@@ -761,6 +760,12 @@ def check_all_command_guards(command: str, env_type: str,
                             "approvals.cron_mode: approve in config.yaml."
                         ),
                     }
+        return {"approved": True, "message": None}
+
+    # Interactive / gateway approval flow: approvals.mode=off suppresses
+    # prompts here, but cron sessions above still respect approvals.cron_mode.
+    approval_mode = _get_approval_mode()
+    if approval_mode == "off":
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---

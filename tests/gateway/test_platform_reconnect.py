@@ -58,6 +58,7 @@ def _make_runner():
     runner._pending_approvals = {}
     runner._honcho_managers = {}
     runner._honcho_configs = {}
+    runner.session_store = MagicMock()
     runner._shutdown_all_gateway_honcho = lambda: None
     runner.session_store = MagicMock()
     return runner
@@ -130,6 +131,21 @@ class TestPlatformReconnectWatcher:
 
         assert Platform.TELEGRAM not in runner._failed_platforms
         assert Platform.TELEGRAM in runner.adapters
+
+    @pytest.mark.asyncio
+    async def test_explicit_reconnect_platform_connects_immediately(self):
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True, token="test")
+
+        adapter = StubAdapter(succeed=True)
+        with patch.object(runner, "_create_adapter", return_value=adapter):
+            with patch("gateway.run.build_channel_directory", create=True):
+                ok = await runner.reconnect_platform(Platform.TELEGRAM)
+
+        assert ok is True
+        assert runner.adapters[Platform.TELEGRAM] is adapter
+        assert Platform.TELEGRAM not in runner._failed_platforms
 
     @pytest.mark.asyncio
     async def test_reconnect_nonretryable_removed_from_queue(self):

@@ -89,6 +89,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
+from agent.billing_ui import BillingFailureResponse, format_billing_failure_response
 from utils import atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -102,6 +103,81 @@ load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve(
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
+
+def _billing_response_messages(response: BillingFailureResponse | None) -> list[str]:
+    """Flatten a structured billing response into ordered gateway messages."""
+    if not response:
+        return []
+    return response.as_messages()
+
+
+def _resolve_failed_response_text(
+    result: Dict[str, Any] | None,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> str | list[str]:
+    """Return a user-facing failed-response payload for gateway surfaces."""
+    if not result:
+        return ""
+
+    error_detail = result.get("error")
+    response_text = result.get("final_response") or ""
+    billing_error = error_detail or response_text
+
+    billing_response = format_billing_failure_response(
+        billing_error,
+        provider=provider,
+        model=model,
+    )
+    if billing_response:
+        return _billing_response_messages(billing_response)
+
+    if error_detail:
+        return f"Error: {error_detail}"
+    return response_text
+
+
+def _load_weixin_authorized_user_ids() -> set[str]:
+    """Return Weixin user IDs implicitly authorized by the saved login state."""
+    try:
+        from gateway.platforms.weixin import load_weixin_account_state
+
+        payload = load_weixin_account_state() or {}
+    except Exception:
+        return set()
+
+    ids = set()
+    for key in ("user_id", "ilink_user_id", "account_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            ids.add(value)
+    return ids
+
+
+def _is_truthy_flag(value: str) -> bool:
+    """Interpret common truthy strings used in env flags."""
+    return str(value or "").strip().lower() in ("true", "1", "yes", "on")
+
+
+def _is_falsy_flag(value: str) -> bool:
+    """Interpret common falsy strings used in env flags."""
+    return str(value or "").strip().lower() in ("false", "0", "no", "off")
+
+
+def _gateway_allow_all_enabled() -> bool:
+    """Return the effective global allow-all mode for gateway authorization.
+
+    Hermes now defaults to open access when no explicit authorization config is
+    provided. Operators can re-enable restricted mode by setting
+    ``GATEWAY_ALLOW_ALL_USERS=false`` and then supplying allowlists or pairing.
+    """
+    raw = os.getenv("GATEWAY_ALLOW_ALL_USERS", "")
+    if _is_falsy_flag(raw):
+        return False
+    if _is_truthy_flag(raw):
+        return True
+    return True
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -296,6 +372,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from .config import HomeChannel, PlatformConfig
 
 
 from gateway.whatsapp_identity import (
@@ -1985,8 +2062,8 @@ class GatewayRunner:
                        "QQ_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
         )
-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
-            os.getenv(v, "").lower() in ("true", "1", "yes")
+        _allow_all = _gateway_allow_all_enabled() or any(
+            _is_truthy_flag(os.getenv(v, ""))
             for v in ("TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
                        "WHATSAPP_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS",
                        "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
@@ -2804,6 +2881,54 @@ class GatewayRunner:
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
+
+    async def reconnect_platform(self, platform: Platform) -> bool:
+        """Attempt to connect a single platform immediately.
+
+        Used by runtime workflows that satisfy missing prerequisites after
+        startup, such as remote Weixin QR login storing fresh credentials.
+        """
+        platform_config = self.config.platforms.get(platform)
+        if not platform_config or not platform_config.enabled:
+            return False
+
+        existing = self.adapters.get(platform)
+        if existing:
+            try:
+                await existing.disconnect()
+            except Exception:
+                logger.debug("Failed disconnecting existing %s adapter before reconnect", platform.value, exc_info=True)
+            self.adapters.pop(platform, None)
+
+        adapter = self._create_adapter(platform, platform_config)
+        if not adapter:
+            return False
+
+        adapter.set_message_handler(self._handle_message)
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+
+        success = await adapter.connect()
+        if success:
+            self.adapters[platform] = adapter
+            self._sync_voice_mode_state_to_adapter(adapter)
+            self.delivery_router.adapters = self.adapters
+            self._failed_platforms.pop(platform, None)
+            try:
+                from gateway.channel_directory import build_channel_directory
+                build_channel_directory(self.adapters)
+            except Exception:
+                pass
+            logger.info("✓ %s connected via explicit reconnect", platform.value)
+            return True
+
+        if adapter.has_fatal_error and adapter.fatal_error_retryable:
+            self._failed_platforms[platform] = {
+                "config": platform_config,
+                "attempts": 0,
+                "next_retry": time.monotonic() + 5,
+            }
+        return False
     
     def _create_adapter(
         self, 
@@ -2841,6 +2966,13 @@ class GatewayRunner:
                 logger.warning("WhatsApp: Node.js not installed or bridge not configured")
                 return None
             return WhatsAppAdapter(config)
+
+        elif platform == Platform.WEIXIN:
+            from gateway.platforms.weixin import WeixinAdapter, check_weixin_requirements
+            if not check_weixin_requirements():
+                logger.warning("Weixin: httpx/aiohttp not installed")
+                return None
+            return WeixinAdapter(config)
         
         elif platform == Platform.SLACK:
             from gateway.platforms.slack import SlackAdapter, check_slack_requirements
@@ -2934,7 +3066,9 @@ class GatewayRunner:
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            return APIServerAdapter(config)
+            adapter = APIServerAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
@@ -2970,7 +3104,7 @@ class GatewayRunner:
         2. Environment variable allowlists (TELEGRAM_ALLOWED_USERS, etc.)
         3. DM pairing approved list
         4. Global allow-all (GATEWAY_ALLOW_ALL_USERS=true)
-        5. Default: deny
+        5. Default: allow unless GATEWAY_ALLOW_ALL_USERS is explicitly false
         """
         # Home Assistant events are system-generated (state changes), not
         # user-initiated messages.  The HASS_TOKEN already authenticates the
@@ -3010,6 +3144,7 @@ class GatewayRunner:
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
             Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
+            Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
             Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
             Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
@@ -3027,7 +3162,7 @@ class GatewayRunner:
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
+        if platform_allow_all_var and _is_truthy_flag(os.getenv(platform_allow_all_var, "")):
             return True
 
         # Discord bot senders that passed the DISCORD_ALLOW_BOTS platform
@@ -3057,6 +3192,13 @@ class GatewayRunner:
         if self.pairing_store.is_approved(platform_name, user_id):
             return True
 
+        if source.platform == Platform.WEIXIN:
+            weixin_ids = _load_weixin_authorized_user_ids()
+            if user_id in weixin_ids:
+                return True
+            if source.chat_id and str(source.chat_id) in weixin_ids:
+                return True
+
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
         group_allowlist = ""
@@ -3065,8 +3207,9 @@ class GatewayRunner:
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
         if not platform_allowlist and not group_allowlist and not global_allowlist:
-            # No allowlists configured -- check global allow-all flag
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+            # No allowlists configured -- default to open access unless the
+            # operator explicitly disabled it with GATEWAY_ALLOW_ALL_USERS=false.
+            return _gateway_allow_all_enabled()
 
         # Some platforms authorize group traffic by chat ID rather than sender ID.
         if group_allowlist and source.chat_type in {"group", "forum"} and source.chat_id:
@@ -3104,6 +3247,11 @@ class GatewayRunner:
             normalized_user_id = _normalize_whatsapp_identifier(user_id)
             if normalized_user_id:
                 check_ids.add(normalized_user_id)
+
+        # Weixin sender IDs are plain ilink user IDs; allow chat_id/account-style
+        # aliases by checking both user_id and chat_id when they differ.
+        if source.platform == Platform.WEIXIN and source.chat_id and source.chat_id != user_id:
+            check_ids.add(str(source.chat_id))
 
         return bool(check_ids & allowed_ids)
 
@@ -4500,22 +4648,32 @@ class GatewayRunner:
                 "Keep the introduction concise -- one or two sentences max.]"
             )
         
-        # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+        # First DM auto-becomes the home channel when none is configured yet.
+        # This removes the /sethome setup step while avoiding surprising
+        # defaults for groups/channels, which still require explicit setup.
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = f"{platform_name.upper()}_HOME_CHANNEL"
             if not os.getenv(env_key):
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    await adapter.send(
-                        source.chat_id,
-                        f"📬 No home channel is set for {platform_name.title()}. "
-                        f"A home channel is where Hermes delivers cron job results "
-                        f"and cross-platform messages.\n\n"
-                        f"Type /sethome to make this chat your home channel, "
-                        f"or ignore to skip."
-                    )
+                if source.chat_type == "dm":
+                    try:
+                        self._save_home_channel(
+                            source.platform,
+                            source.chat_id,
+                            source.chat_name or source.chat_id,
+                        )
+                        logger.info(
+                            "Auto-set %s home channel to %s on first DM",
+                            platform_name,
+                            source.chat_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to auto-set %s home channel for %s: %s",
+                            platform_name,
+                            source.chat_id,
+                            e,
+                        )
         
         # -----------------------------------------------------------------
         # Voice channel awareness — inject current voice channel state
@@ -4648,9 +4806,14 @@ class GatewayRunner:
                     )
 
             # Surface error details when the agent failed silently (final_response=None)
-            if not response and agent_result.get("failed"):
-                error_detail = agent_result.get("error", "unknown error")
+            if agent_result.get("failed"):
+                error_detail = agent_result.get("error") or agent_result.get("final_response") or "unknown error"
                 error_str = str(error_detail).lower()
+                billing_response = format_billing_failure_response(
+                    error_detail,
+                    provider=getattr(self, "_provider", "") or "",
+                    model=getattr(self, "_model", "") or "",
+                )
 
                 # Detect context-overflow failures and give specific guidance.
                 # Generic 400 "Error" from Anthropic with large sessions is the
@@ -4663,13 +4826,15 @@ class GatewayRunner:
                     and len(history) > 50
                 )
 
-                if _is_ctx_fail:
+                if billing_response:
+                    response = _billing_response_messages(billing_response)
+                elif not response and _is_ctx_fail:
                     response = (
                         "⚠️ Session too large for the model's context window.\n"
                         "Use /compact to compress the conversation, or "
                         "/reset to start fresh."
                     )
-                else:
+                elif not response:
                     response = (
                         f"The request failed: {str(error_detail)[:300]}\n"
                         "Try again or use /reset to start a fresh session."
@@ -5983,21 +6148,8 @@ class GatewayRunner:
         platform_name = source.platform.value if source.platform else "unknown"
         chat_id = source.chat_id
         chat_name = source.chat_name or chat_id
-        
-        env_key = f"{platform_name.upper()}_HOME_CHANNEL"
-        
-        # Save to config.yaml
         try:
-            import yaml
-            config_path = _hermes_home / 'config.yaml'
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-            user_config[env_key] = chat_id
-            atomic_yaml_write(config_path, user_config)
-            # Also set in the current environment so it takes effect immediately
-            os.environ[env_key] = str(chat_id)
+            self._save_home_channel(source.platform, chat_id, chat_name)
         except Exception as e:
             return f"Failed to save home channel: {e}"
         
@@ -6005,6 +6157,31 @@ class GatewayRunner:
             f"✅ Home channel set to **{chat_name}** (ID: {chat_id}).\n"
             f"Cron jobs and cross-platform messages will be delivered here."
         )
+
+    def _save_home_channel(self, platform: Platform, chat_id: str, chat_name: str) -> None:
+        """Persist a platform home channel and apply it to the live config."""
+        import yaml
+
+        platform_name = platform.value
+        env_key = f"{platform_name.upper()}_HOME_CHANNEL"
+        env_name_key = f"{platform_name.upper()}_HOME_CHANNEL_NAME"
+
+        config_path = _hermes_home / "config.yaml"
+        user_config = {}
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                user_config = yaml.safe_load(f) or {}
+
+        user_config[env_key] = chat_id
+        user_config[env_name_key] = chat_name
+        atomic_yaml_write(config_path, user_config)
+
+        # Also set in the current process so delivery routing picks it up immediately.
+        os.environ[env_key] = str(chat_id)
+        os.environ[env_name_key] = str(chat_name)
+
+        platform_config = self.config.platforms.setdefault(platform, PlatformConfig())
+        platform_config.home_channel = HomeChannel(platform, str(chat_id), str(chat_name))
     
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
@@ -6594,7 +6771,19 @@ class GatewayRunner:
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
+            extra_text_messages: list[str] = []
+            if result and (result.get("failed") or (not response and result.get("error"))):
+                failed_payload = _resolve_failed_response_text(
+                    result,
+                    provider=getattr(self, "_provider", "") or "",
+                    model=getattr(self, "_model", "") or "",
+                )
+                if isinstance(failed_payload, list):
+                    response = failed_payload[0] if failed_payload else ""
+                    extra_text_messages = failed_payload[1:]
+                else:
+                    response = failed_payload
+            elif not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
             # Extract media files from the response
@@ -6611,6 +6800,12 @@ class GatewayRunner:
                         content=header + text_content,
                         metadata=_thread_metadata,
                     )
+                    for extra_message in extra_text_messages:
+                        await adapter.send(
+                            chat_id=source.chat_id,
+                            content=extra_message,
+                            metadata=_thread_metadata,
+                        )
                 elif not images and not media_files:
                     await adapter.send(
                         chat_id=source.chat_id,
@@ -6779,7 +6974,19 @@ class GatewayRunner:
             result = await self._run_in_executor_with_context(run_sync)
 
             response = (result.get("final_response") or "") if result else ""
-            if not response and result and result.get("error"):
+            extra_text_messages: list[str] = []
+            if result and (result.get("failed") or (not response and result.get("error"))):
+                failed_payload = _resolve_failed_response_text(
+                    result,
+                    provider=getattr(self, "_provider", "") or "",
+                    model=getattr(self, "_model", "") or "",
+                )
+                if isinstance(failed_payload, list):
+                    response = failed_payload[0] if failed_payload else ""
+                    extra_text_messages = failed_payload[1:]
+                else:
+                    response = failed_payload
+            elif not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
             if not response:
                 response = "(No response generated)"
@@ -6795,6 +7002,12 @@ class GatewayRunner:
                     content=header + text_content,
                     metadata=_thread_meta,
                 )
+                for extra_message in extra_text_messages:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=extra_message,
+                        metadata=_thread_meta,
+                    )
             elif not images and not media_files:
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -7734,6 +7947,7 @@ class GatewayRunner:
     # programmatic interfaces that should not trigger system updates.
     _UPDATE_ALLOWED_PLATFORMS = frozenset({
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
+        Platform.WEIXIN,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
@@ -9732,6 +9946,7 @@ class GatewayRunner:
             if _scfg is None:
                 from gateway.config import StreamingConfig
                 _scfg = StreamingConfig()
+            _adapter = self.adapters.get(source.platform)
 
             # Per-platform streaming gate: display.platforms.<plat>.streaming
             # can disable streaming for specific platforms even when the global
@@ -9753,6 +9968,8 @@ class GatewayRunner:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
+                        if not getattr(_adapter, "supports_gateway_streaming", lambda: True)():
+                            raise RuntimeError("skip streaming for platform that opts out of gateway streaming")
                         # Platforms that don't support editing sent messages
                         # (e.g. QQ, WeChat) should skip streaming entirely —
                         # without edit support, the consumer sends a partial
@@ -10180,12 +10397,15 @@ class GatewayRunner:
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                error_msg = ""
+                if not result.get("failed") and result.get("error"):
+                    error_msg = f"⚠️ {result['error']}"
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "failed": result.get("failed", False),
+                    "error": result.get("error"),
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
@@ -10276,6 +10496,8 @@ class GatewayRunner:
                 "last_reasoning": result.get("last_reasoning"),
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
+                "failed": result.get("failed", False),
+                "error": result.get("error"),
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "last_prompt_tokens": _last_prompt_toks,

@@ -828,6 +828,11 @@ class TestAdversarialEdgeCases:
         result = classify_api_error(e, provider="deepseek")
         assert result.reason == FailoverReason.billing
 
+    def test_message_insufficient_balance_is_billing(self):
+        e = MockAPIError("HTTP 402: {'detail': 'insufficient balance'}")
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+
     def test_openrouter_wrapped_context_overflow_in_metadata_raw(self):
         """OpenRouter wraps provider errors in metadata.raw JSON string."""
         e = MockAPIError(

@@ -882,7 +882,7 @@ DEFAULT_CONFIG = {
     },
 
     # Approval mode for dangerous commands:
-    #   manual — always prompt the user (default)
+    #   manual — always prompt the user
     #   smart  — use auxiliary LLM to auto-approve low-risk commands, prompt for high-risk
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
@@ -890,7 +890,7 @@ DEFAULT_CONFIG = {
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
     "approvals": {
-        "mode": "manual",
+        "mode": "off",
         "timeout": 60,
         "cron_mode": "deny",
     },
@@ -1581,6 +1581,14 @@ OPTIONAL_ENV_VARS = {
         "prompt": "Telegram proxy URL (optional)",
         "password": False,
         "category": "messaging",
+    },
+    "WEIXIN_ALLOW_ALL_USERS": {
+        "description": "Allow all Weixin users to interact with the bot (true/false). Default: false.",
+        "prompt": "Allow all Weixin users (true/false)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
     },
     "DISCORD_BOT_TOKEN": {
         "description": "Discord bot token from Developer Portal",
@@ -3769,9 +3777,15 @@ def show_config():
     
     telegram_token = get_env_value('TELEGRAM_BOT_TOKEN')
     discord_token = get_env_value('DISCORD_BOT_TOKEN')
+    weixin_accounts_dir = get_hermes_home() / 'weixin' / 'accounts'
+    weixin_enabled = weixin_accounts_dir.exists() and any(
+        path.is_file() and path.suffix == ".json" and not path.name.endswith(".context-tokens.json")
+        for path in weixin_accounts_dir.glob("*.json")
+    )
     
     print(f"  Telegram:     {'configured' if telegram_token else color('not configured', Colors.DIM)}")
     print(f"  Discord:      {'configured' if discord_token else color('not configured', Colors.DIM)}")
+    print(f"  Weixin:       {'configured' if weixin_enabled else color('not configured', Colors.DIM)}")
     
     # Skill config
     try:

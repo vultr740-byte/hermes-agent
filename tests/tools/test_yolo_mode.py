@@ -25,6 +25,12 @@ def _clear_approval_state():
     approval_module.clear_session("test-session")
     approval_module.clear_session("session-a")
     approval_module.clear_session("session-b")
+
+
+@pytest.fixture(autouse=True)
+def _force_manual_approval_mode(monkeypatch):
+    """YOLO tests compare against normal approval flow, which should stay manual."""
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
     yield
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")

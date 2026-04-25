@@ -290,6 +290,12 @@ class TestBlocklistCoverage:
         }
         assert extras.issubset(_HERMES_PROVIDER_ENV_BLOCKLIST)
 
+    def test_weixin_runtime_vars_are_in_blocklist(self):
+        extras = {
+            "WEIXIN_ALLOW_ALL_USERS",
+        }
+        assert extras.issubset(_HERMES_PROVIDER_ENV_BLOCKLIST)
+
 
 class TestSanePathIncludesHomebrew:
     """Verify _SANE_PATH includes macOS Homebrew directories."""

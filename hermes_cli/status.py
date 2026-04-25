@@ -328,23 +328,29 @@ def show_status(args):
         "BlueBubbles": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_HOME_CHANNEL"),
         "QQBot": ("QQ_APP_ID", "QQBOT_HOME_CHANNEL"),
     }
-    
+
     for name, (token_var, home_var) in platforms.items():
         token = os.getenv(token_var, "")
         has_token = bool(token)
-        
+
         home_channel = ""
         if home_var:
             home_channel = os.getenv(home_var, "")
         # Back-compat: QQBot home channel was renamed from QQ_HOME_CHANNEL to QQBOT_HOME_CHANNEL
         if not home_channel and home_var == "QQBOT_HOME_CHANNEL":
             home_channel = os.getenv("QQ_HOME_CHANNEL", "")
-        
         status = "configured" if has_token else "not configured"
         if home_channel:
             status += f" (home: {home_channel})"
-        
+
         print(f"  {name:<12}  {check_mark(has_token)} {status}")
+
+    weixin_accounts_dir = get_hermes_home() / "weixin" / "accounts"
+    weixin_ready = weixin_accounts_dir.exists() and any(
+        path.is_file() and path.suffix == ".json" and not path.name.endswith(".context-tokens.json")
+        for path in weixin_accounts_dir.glob("*.json")
+    )
+    print(f"  {'Weixin':<12}  {check_mark(weixin_ready)} {'configured' if weixin_ready else 'not configured'}")
     
     # =========================================================================
     # Gateway Status

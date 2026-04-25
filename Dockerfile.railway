@@ -1,0 +1,40 @@
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HERMES_HOME=/opt/data
+
+RUN apt-get update \
+    -o Acquire::Retries=5 \
+    -o Acquire::http::Timeout=30 \
+    -o Acquire::https::Timeout=30 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        gosu \
+        passwd \
+        procps \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -u 10000 -m -d /opt/data hermes
+
+COPY . /opt/hermes
+WORKDIR /opt/hermes
+
+RUN python -m venv /opt/hermes/.venv \
+    && . /opt/hermes/.venv/bin/activate \
+    && pip install --upgrade pip setuptools wheel \
+    && pip install -e . \
+    && pip install \
+        "python-telegram-bot[webhooks]>=22.6,<23" \
+        "aiohttp>=3.13.3,<4" \
+        "croniter>=6.0.0,<7" \
+        "ptyprocess>=0.7.0,<1"
+
+RUN chmod +x /opt/hermes/docker/entrypoint.sh
+
+ENV PATH=/opt/hermes/.venv/bin:$PATH
+VOLUME ["/opt/data"]
+
+ENTRYPOINT ["/opt/hermes/docker/entrypoint.sh"]
+CMD ["gateway", "run", "--replace"]

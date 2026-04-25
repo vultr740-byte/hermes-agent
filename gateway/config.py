@@ -22,6 +22,47 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def _has_weixin_account_state() -> bool:
+    """Return True when a persisted Weixin login session exists."""
+    state = _load_weixin_account_state_fallback()
+    return bool(state and state.get("bot_token"))
+
+
+def _load_weixin_account_state_fallback() -> Dict[str, Any]:
+    """Load persisted Weixin credentials without requiring env vars."""
+    try:
+        from gateway.platforms.weixin import load_weixin_account_state
+
+        state = load_weixin_account_state()
+        if not isinstance(state, dict):
+            return {}
+        token = str(state.get("bot_token") or "").strip()
+        account_id = str(state.get("account_id") or "").strip()
+        if not token or not account_id:
+            return {}
+        return state
+    except Exception:
+        return {}
+
+
+def _enabled_channel() -> Optional[str]:
+    """Return the configured single enabled messaging channel, if any."""
+    value = str(os.getenv("HERMES_ENABLED_CHANNEL") or "").strip().lower().replace("-", "_")
+    return value or None
+
+
+def _channel_is_enabled(name: str) -> bool:
+    """Return True when the single-channel selector enables this platform."""
+    selected = _enabled_channel()
+    return selected == name
+
+
+def _single_channel_filter_allows(name: str) -> bool:
+    """Return True when no single-channel filter is set or it matches ``name``."""
+    selected = _enabled_channel()
+    return selected is None or selected == name
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
@@ -67,7 +108,6 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
-
 
 @dataclass
 class HomeChannel:
@@ -855,7 +895,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if telegram_token:
+    if telegram_token and _single_channel_filter_allows(Platform.TELEGRAM.value):
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].enabled = True
@@ -909,11 +949,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     
     # WhatsApp (typically uses different auth mechanism)
     whatsapp_enabled = os.getenv("WHATSAPP_ENABLED", "").lower() in ("true", "1", "yes")
-    if whatsapp_enabled:
+    if whatsapp_enabled and _single_channel_filter_allows(Platform.WHATSAPP.value):
         if Platform.WHATSAPP not in config.platforms:
             config.platforms[Platform.WHATSAPP] = PlatformConfig()
         config.platforms[Platform.WHATSAPP].enabled = True
-    
+
+    # Weixin personal account (QR login + iLink long-poll)
+    # Register the platform whenever it is the selected channel so fresh
+    # deployments can complete QR login first, then reconnect in-process.
+    if _channel_is_enabled(Platform.WEIXIN.value):
+        if Platform.WEIXIN not in config.platforms:
+            config.platforms[Platform.WEIXIN] = PlatformConfig()
+        config.platforms[Platform.WEIXIN].enabled = True
+        if os.getenv("WEIXIN_POLL_TIMEOUT_MS"):
+            config.platforms[Platform.WEIXIN].extra["poll_timeout_ms"] = os.getenv("WEIXIN_POLL_TIMEOUT_MS")
+
     # Slack
     slack_token = os.getenv("SLACK_BOT_TOKEN")
     if slack_token:
@@ -1176,9 +1226,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         })
 
     # Weixin (personal WeChat via iLink Bot API)
+    weixin_state = _load_weixin_account_state_fallback()
     weixin_token = os.getenv("WEIXIN_TOKEN")
     weixin_account_id = os.getenv("WEIXIN_ACCOUNT_ID")
-    if weixin_token or weixin_account_id:
+    if not weixin_token:
+        weixin_token = str(weixin_state.get("bot_token") or "").strip() or None
+    if not weixin_account_id:
+        weixin_account_id = str(weixin_state.get("account_id") or "").strip() or None
+    if (weixin_token or weixin_account_id) and _single_channel_filter_allows(Platform.WEIXIN.value):
         if Platform.WEIXIN not in config.platforms:
             config.platforms[Platform.WEIXIN] = PlatformConfig()
         config.platforms[Platform.WEIXIN].enabled = True
@@ -1188,6 +1243,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if weixin_account_id:
             extra["account_id"] = weixin_account_id
         weixin_base_url = os.getenv("WEIXIN_BASE_URL", "").strip()
+        if not weixin_base_url:
+            weixin_base_url = str(weixin_state.get("base_url") or "").strip()
         if weixin_base_url:
             extra["base_url"] = weixin_base_url.rstrip("/")
         weixin_cdn_base_url = os.getenv("WEIXIN_CDN_BASE_URL", "").strip()

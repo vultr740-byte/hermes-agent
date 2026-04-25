@@ -245,6 +245,22 @@ class TestCronModeInteractions:
             result = check_dangerous_command("rm -rf /", "local")
             assert result["approved"]
 
+    def test_approval_mode_off_does_not_override_cron_deny_in_combined_guard(self, monkeypatch):
+        """Global approval bypass for interactive sessions must not disable cron deny mode."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_approval_mode", return_value="off"), \
+             mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+            assert not result["approved"]
+            assert "BLOCKED" in result["message"]
+            assert "cron_mode" in result["message"]
+
     def test_non_cron_non_interactive_still_auto_approves(self, monkeypatch):
         """Non-cron, non-interactive sessions (e.g. scripted usage) still auto-approve."""
         monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)

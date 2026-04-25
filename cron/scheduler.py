@@ -74,7 +74,7 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
-    "telegram", "discord", "slack", "whatsapp", "signal",
+    "telegram", "discord", "slack", "whatsapp", "weixin", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot",
@@ -120,6 +120,48 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_DEFAULT_LOCK_DIR = _LOCK_DIR
+_DEFAULT_LOCK_FILE = _LOCK_FILE
+
+
+def _current_lock_paths() -> tuple[Path, Path]:
+    """Return the effective cron lock paths for the current HERMES_HOME.
+
+    Tests may patch ``_LOCK_DIR`` / ``_LOCK_FILE`` directly, so preserve that
+    override. Otherwise resolve from ``get_hermes_home()`` at call time so a
+    late HERMES_HOME change does not leave the scheduler using a stale lock
+    path from module import time.
+    """
+    if (_LOCK_DIR, _LOCK_FILE) != (_DEFAULT_LOCK_DIR, _DEFAULT_LOCK_FILE):
+        return _LOCK_DIR, _LOCK_FILE
+    dynamic_dir = get_hermes_home() / "cron"
+    dynamic_file = dynamic_dir / ".tick.lock"
+    return dynamic_dir, dynamic_file
+
+
+def _home_channel_target(config, platform_name: str) -> Optional[dict]:
+    """Resolve a platform's home channel from gateway config."""
+    from gateway.config import Platform
+
+    try:
+        platform = Platform(platform_name.lower())
+    except ValueError:
+        return None
+    home = config.get_home_channel(platform) if config is not None else None
+    if not home or not str(home.chat_id or "").strip():
+        chat_id = _get_home_target_chat_id(platform.value)
+        if not chat_id:
+            return None
+        return {
+            "platform": platform.value,
+            "chat_id": chat_id,
+            "thread_id": None,
+        }
+    return {
+        "platform": platform.value,
+        "chat_id": str(home.chat_id),
+        "thread_id": None,
+    }
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -149,11 +191,16 @@ def _get_home_target_chat_id(platform_name: str) -> str:
 
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
-
     origin = _resolve_origin(job)
 
     if deliver_value == "local":
         return None
+
+    try:
+        from gateway.config import load_gateway_config as _load_gateway_config
+        config = _load_gateway_config()
+    except Exception:
+        config = None
 
     if deliver_value == "origin":
         if origin:
@@ -165,18 +212,14 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
         for platform_name in _HOME_TARGET_ENV_VARS:
-            chat_id = _get_home_target_chat_id(platform_name)
-            if chat_id:
+            target = _home_channel_target(config, platform_name)
+            if target:
                 logger.info(
                     "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
                     job.get("name", job.get("id", "?")),
                     platform_name,
                 )
-                return {
-                    "platform": platform_name,
-                    "chat_id": chat_id,
-                    "thread_id": None,
-                }
+                return target
         return None
 
     if ":" in deliver_value:
@@ -220,6 +263,9 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if platform_name.lower() not in _KNOWN_DELIVERY_PLATFORMS:
         return None
+    target = _home_channel_target(config, platform_name)
+    if target:
+        return target
     chat_id = _get_home_target_chat_id(platform_name)
     if not chat_id:
         return None
@@ -324,6 +370,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "discord": Platform.DISCORD,
         "slack": Platform.SLACK,
         "whatsapp": Platform.WHATSAPP,
+        "weixin": Platform.WEIXIN,
         "signal": Platform.SIGNAL,
         "matrix": Platform.MATRIX,
         "mattermost": Platform.MATTERMOST,
@@ -1145,12 +1192,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_dir, lock_file = _current_lock_paths()
+    lock_dir.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     lock_fd = None
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        lock_fd = open(lock_file, "w")
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:

@@ -1,5 +1,6 @@
 """Tests for gateway configuration management."""
 
+import json
 import os
 from unittest.mock import patch
 
@@ -441,6 +442,45 @@ class TestLoadGatewayConfig:
 
         import os
         assert os.environ.get("TELEGRAM_PROXY") == "socks5://from-env:1080"
+
+    def test_weixin_uses_persisted_account_state_without_env_credentials(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        accounts_dir = hermes_home / "weixin" / "accounts"
+        accounts_dir.mkdir(parents=True)
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  weixin:\n"
+            "    home_channel:\n"
+            "      platform: weixin\n"
+            "      chat_id: wxid_home_1\n"
+            "      name: Home\n",
+            encoding="utf-8",
+        )
+        (accounts_dir / "084392601658@im.bot.json").write_text(
+            json.dumps(
+                {
+                    "token": "tok-123",
+                    "base_url": "https://ilinkai.weixin.qq.com",
+                    "user_id": "wxid_user_1",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("WEIXIN_TOKEN", raising=False)
+        monkeypatch.delenv("WEIXIN_ACCOUNT_ID", raising=False)
+        monkeypatch.delenv("WEIXIN_BASE_URL", raising=False)
+
+        config = load_gateway_config()
+        pconfig = config.platforms[Platform.WEIXIN]
+
+        assert pconfig.enabled is True
+        assert pconfig.token == "tok-123"
+        assert pconfig.extra["account_id"] == "084392601658@im.bot"
+        assert pconfig.extra["base_url"] == "https://ilinkai.weixin.qq.com"
+        assert pconfig.home_channel is not None
+        assert pconfig.home_channel.chat_id == "wxid_home_1"
 
 
 class TestHomeChannelEnvOverrides:

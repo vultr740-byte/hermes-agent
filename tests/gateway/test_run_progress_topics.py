@@ -5,13 +5,17 @@ import importlib
 import sys
 import time
 import types
+from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import StreamingConfig
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -133,12 +137,30 @@ class DelayedInterimAgent:
             "api_calls": 1,
         }
 
+class StreamingCallbackCaptureAgent:
+    """Capture whether gateway wired a stream delta callback into the agent."""
+
+    last_stream_delta_callback = None
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+        type(self).last_stream_delta_callback = kwargs.get("stream_delta_callback")
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
 
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -150,10 +172,9 @@ def _make_runner(adapter):
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
-    runner.config = SimpleNamespace(
-        thread_sessions_per_user=False,
-        group_sessions_per_user=False,
-        stt_enabled=False,
+    runner.session_store = SimpleNamespace(
+        has_any_sessions=lambda: False,
+        _save=lambda: None,
     )
     return runner
 
@@ -203,6 +224,286 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     ]
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_weixin_disables_gateway_streaming_consumer(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = StreamingCallbackCaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    from gateway.config import GatewayConfig, StreamingConfig
+    from gateway.platforms.weixin import WeixinAdapter
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+
+    adapter = WeixinAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="bot-token",
+            extra={"account_id": "bot-account"},
+        )
+    )
+    runner = _make_runner(adapter)
+    runner.config = GatewayConfig(streaming=StreamingConfig(enabled=True, transport="edit"))
+
+    source = SessionSource(
+        platform=Platform.WEIXIN,
+        chat_id="wxid_test123",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-weixin-1",
+        session_key="agent:main:weixin:dm:wxid_test123",
+    )
+
+    assert result["final_response"] == "done"
+    assert StreamingCallbackCaptureAgent.last_stream_delta_callback is None
+
+
+@pytest.mark.asyncio
+async def test_handle_message_formats_billing_failures_for_users(monkeypatch, tmp_path):
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_config_path", tmp_path / "config.yaml")
+    monkeypatch.setenv("RECHARGE_TARGET", "weixin_demo_target")
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._update_runtime_status = MagicMock()
+    runner._background_tasks = set()
+    runner._draining = False
+    runner._restart_requested = False
+    runner._restart_task_started = False
+    runner._restart_detached = False
+    runner._restart_via_service = False
+    runner._restart_drain_timeout = 0.0
+    runner._stop_task = None
+    runner._exit_code = None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": None,
+            "messages": [],
+            "api_calls": 1,
+            "failed": True,
+            "error": "Payment Required: insufficient credits",
+        }
+    )
+    runner._show_reasoning = False
+    runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
+    runner._emit_gateway_run_progress = AsyncMock()
+    runner._set_session_env = lambda _context: None
+    runner._clear_session_env = lambda _tokens: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._send_voice_reply = AsyncMock()
+    runner.hooks.emit = AsyncMock()
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="telegram-user-1",
+        chat_id="chat-1",
+        chat_type="dm",
+        thread_id=None,
+    )
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-billing",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    result = await runner._handle_message(event)
+
+    assert result == [
+        "⚠️ 模型余额不足，请充值后重试。",
+        "https://www.xialiao.app/recharge/weixin_demo_target",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_message_formats_retry_exhausted_billing_failures(monkeypatch, tmp_path):
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_config_path", tmp_path / "config.yaml")
+    monkeypatch.setenv("RECHARGE_TARGET", "weixin_demo_target")
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._update_runtime_status = MagicMock()
+    runner._background_tasks = set()
+    runner._draining = False
+    runner._restart_requested = False
+    runner._restart_task_started = False
+    runner._restart_detached = False
+    runner._restart_via_service = False
+    runner._restart_drain_timeout = 0.0
+    runner._stop_task = None
+    runner._exit_code = None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "API call failed after 3 retries: HTTP 402: Error code: 402 - {'detail': 'insufficient balance'}",
+            "messages": [],
+            "api_calls": 1,
+            "failed": True,
+            "error": "HTTP 402: Error code: 402 - {'detail': 'insufficient balance'}",
+        }
+    )
+    runner._show_reasoning = False
+    runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
+    runner._emit_gateway_run_progress = AsyncMock()
+    runner._set_session_env = lambda _context: None
+    runner._clear_session_env = lambda _tokens: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._send_voice_reply = AsyncMock()
+    runner.hooks.emit = AsyncMock()
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="telegram-user-1",
+        chat_id="chat-1",
+        chat_type="dm",
+        thread_id=None,
+    )
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-billing-402",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    result = await runner._handle_message(event)
+
+    assert result == [
+        "⚠️ 模型余额不足，请充值后重试。",
+        "https://www.xialiao.app/recharge/weixin_demo_target",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_first_dm_auto_sets_home_channel(monkeypatch, tmp_path):
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.delenv("WEIXIN_HOME_CHANNEL", raising=False)
+    monkeypatch.delenv("WEIXIN_HOME_CHANNEL_NAME", raising=False)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.WEIXIN)
+    runner = _make_runner(adapter)
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._update_runtime_status = MagicMock()
+    runner._background_tasks = set()
+    runner._draining = False
+    runner._restart_requested = False
+    runner._restart_task_started = False
+    runner._restart_detached = False
+    runner._restart_via_service = False
+    runner._restart_drain_timeout = 0.0
+    runner._stop_task = None
+    runner._exit_code = None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+    )
+    runner._show_reasoning = False
+    runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
+    runner._emit_gateway_run_progress = AsyncMock()
+    runner._set_session_env = lambda _context: None
+    runner._clear_session_env = lambda _tokens: None
+    runner._session_db = None
+    runner.hooks.emit = AsyncMock()
+
+    source = SessionSource(
+        platform=Platform.WEIXIN,
+        user_id="weixin-user-1",
+        chat_id="wxid_auto_home",
+        chat_name="Alice",
+        chat_type="dm",
+        thread_id=None,
+    )
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-weixin-home",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.WEIXIN,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = False
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    result = await runner._handle_message(event)
+
+    assert result == "done"
+    home = runner.config.get_home_channel(Platform.WEIXIN)
+    assert home is not None
+    assert home.chat_id == "wxid_auto_home"
+    assert home.name == "Alice"
+    config_text = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    assert "WEIXIN_HOME_CHANNEL: wxid_auto_home" in config_text
 
 
 @pytest.mark.asyncio

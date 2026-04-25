@@ -2507,6 +2507,12 @@ _PLATFORMS = [
         "token_var": "WHATSAPP_ENABLED",
     },
     {
+        "key": "weixin",
+        "label": "Weixin",
+        "emoji": "💬",
+        "token_var": "WEIXIN_ALLOW_ALL_USERS",
+    },
+    {
         "key": "signal",
         "label": "Signal",
         "emoji": "📡",
@@ -2741,6 +2747,14 @@ def _platform_status(platform: dict) -> str:
             if session_file.exists():
                 return "configured + paired"
             return "enabled, not paired"
+        return "not configured"
+    if platform.get("key") == "weixin":
+        accounts_dir = get_hermes_home() / "weixin" / "accounts"
+        if accounts_dir.exists() and any(
+            path.is_file() and path.suffix == ".json" and not path.name.endswith(".context-tokens.json")
+            for path in accounts_dir.glob("*.json")
+        ):
+            return "paired"
         return "not configured"
     if platform.get("key") == "signal":
         account = get_env_value("SIGNAL_ACCOUNT")
@@ -3749,10 +3763,10 @@ def gateway_setup():
 
         if platform["key"] == "whatsapp":
             _setup_whatsapp()
-        elif platform["key"] == "signal":
-            _setup_signal()
         elif platform["key"] == "weixin":
             _setup_weixin()
+        elif platform["key"] == "signal":
+            _setup_signal()
         elif platform["key"] == "dingtalk":
             _setup_dingtalk()
         elif platform["key"] == "feishu":
@@ -3768,8 +3782,15 @@ def gateway_setup():
     any_configured = any(
         bool(get_env_value(p["token_var"]))
         for p in _PLATFORMS
-        if p["key"] != "whatsapp"
-    ) or (get_env_value("WHATSAPP_ENABLED") or "").lower() == "true"
+        if p["key"] not in {"whatsapp", "weixin"}
+    ) or (get_env_value("WHATSAPP_ENABLED") or "").lower() == "true" \
+      or (
+          (get_hermes_home() / "weixin" / "accounts").exists()
+          and any(
+              path.is_file() and path.suffix == ".json" and not path.name.endswith(".context-tokens.json")
+              for path in (get_hermes_home() / "weixin" / "accounts").glob("*.json")
+          )
+      )
 
     if any_configured:
         print()
