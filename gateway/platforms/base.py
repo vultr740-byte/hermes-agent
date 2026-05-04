@@ -1112,10 +1112,8 @@ _RETRYABLE_ERROR_PATTERNS = (
 )
 
 
-# Type for message handlers.  Handlers may return a plain string (normal
-# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
-# ``None`` when the response was already delivered (e.g. via streaming).
-MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+MessageHandlerResponse = Optional[str | list[str]]
+MessageHandler = Callable[[MessageEvent], Awaitable[MessageHandlerResponse]]
 
 
 def resolve_channel_prompt(
@@ -1449,6 +1447,16 @@ class BasePlatformAdapter(ABC):
     # such as DingTalk AI Cards) override this to True (class attribute or
     # property) so the stream consumer knows not to short-circuit.
     REQUIRES_EDIT_FINALIZE: bool = False
+
+    def supports_gateway_streaming(self) -> bool:
+        """Return whether gateway token streaming should be enabled for this adapter.
+
+        The gateway streaming transport assumes the platform can present one
+        evolving assistant message cleanly. Platforms without native message
+        editing can degrade into many small chat bubbles, so they may opt out
+        and use the normal final-response send path instead.
+        """
+        return True
 
     async def edit_message(
         self,
@@ -2147,15 +2155,16 @@ class BasePlatformAdapter(ABC):
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
 
-    def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
+    def _unwrap_ephemeral(self, response: Any) -> Tuple[MessageHandlerResponse, int]:
         """Unwrap a handler response into (text, ttl_seconds).
 
-        Accepts a plain string, ``None``, or an :class:`EphemeralReply`.
-        Returns ``(text, ttl)`` where ``ttl > 0`` means the caller should
-        schedule a deletion via :meth:`_schedule_ephemeral_delete` after
-        the send succeeds.  ``ttl`` is forced to 0 when the adapter
-        doesn't override :meth:`delete_message` so non-supporting
-        platforms silently degrade to normal sends.
+        Accepts a plain string, a list of strings, ``None``, or an
+        :class:`EphemeralReply`. Returns ``(text, ttl)`` where ``ttl > 0``
+        means the caller should schedule a deletion via
+        :meth:`_schedule_ephemeral_delete` after the send succeeds.
+        ``ttl`` is forced to 0 when the adapter doesn't override
+        :meth:`delete_message` so non-supporting platforms silently
+        degrade to normal sends.
         """
         if isinstance(response, EphemeralReply):
             ttl = response.ttl_seconds
@@ -2250,6 +2259,39 @@ class BasePlatformAdapter(ABC):
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
+
+    async def _send_text_responses(
+        self,
+        chat_id: str,
+        response: MessageHandlerResponse,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+    ) -> List["SendResult"]:
+        """Send one or more text responses in order."""
+        if isinstance(response, str):
+            messages = [response]
+        elif isinstance(response, list):
+            messages = [msg for msg in response if isinstance(msg, str) and msg.strip()]
+        else:
+            messages = []
+
+        results: List[SendResult] = []
+        for idx, message in enumerate(messages):
+            result = await self._send_with_retry(
+                chat_id=chat_id,
+                content=message,
+                reply_to=reply_to if idx == 0 else None,
+                metadata=metadata,
+            )
+            results.append(result)
+        return results
+
+    def _should_queue_follow_up_without_interrupt(self, event: MessageEvent) -> bool:
+        """Return True when a follow-up should wait for the active run to finish."""
+        if event.message_type == MessageType.PHOTO:
+            return True
+        return self.platform == Platform.WEIXIN and event.message_type == MessageType.TEXT
 
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
@@ -2569,20 +2611,23 @@ class BasePlatformAdapter(ABC):
                 try:
                     _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
                     response = await self._message_handler(event)
-                    _text, _eph_ttl = self._unwrap_ephemeral(response)
-                    if _text:
-                        _r = await self._send_with_retry(
-                            chat_id=event.source.chat_id,
-                            content=_text,
-                            reply_to=event.message_id,
-                            metadata=_thread_meta,
-                        )
-                        if _eph_ttl > 0 and _r.success and _r.message_id:
-                            self._schedule_ephemeral_delete(
+                    if response:
+                        _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        if _text:
+                            _results = await self._send_text_responses(
                                 chat_id=event.source.chat_id,
-                                message_id=_r.message_id,
-                                ttl_seconds=_eph_ttl,
+                                response=_text,
+                                reply_to=event.message_id,
+                                metadata=_thread_meta,
                             )
+                        if _eph_ttl > 0 and _results:
+                            _r = _results[0]
+                            if _r.success and _r.message_id:
+                                self._schedule_ephemeral_delete(
+                                    chat_id=event.source.chat_id,
+                                    message_id=_r.message_id,
+                                    ttl_seconds=_eph_ttl,
+                                )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -2594,11 +2639,17 @@ class BasePlatformAdapter(ABC):
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
 
-            # Special case: photo bursts/albums frequently arrive as multiple near-
-            # simultaneous messages. Queue them without interrupting the active run,
-            # then process them immediately after the current task finishes.
-            if event.message_type == MessageType.PHOTO:
-                logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
+            # Some follow-ups are safer to queue behind the current run instead of
+            # interrupting it immediately. Photo bursts arrive as near-simultaneous
+            # messages, and Weixin text messages may arrive quickly enough to abort
+            # the in-flight reply before it is delivered.
+            if self._should_queue_follow_up_without_interrupt(event):
+                logger.debug(
+                    "[%s] Queuing %s follow-up for session %s without interrupt",
+                    self.name,
+                    event.message_type.value,
+                    session_key,
+                )
                 merge_pending_message_event(self._pending_messages, session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
@@ -2719,6 +2770,18 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+            if response:
+                if isinstance(response, list):
+                    results = await self._send_text_responses(
+                        chat_id=event.source.chat_id,
+                        response=response,
+                        reply_to=event.message_id,
+                        metadata=_thread_metadata,
+                    )
+                    for result in results:
+                        _record_delivery(result)
+                    response = None
+
             if response:
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)

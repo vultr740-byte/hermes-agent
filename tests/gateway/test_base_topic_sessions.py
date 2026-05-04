@@ -48,6 +48,12 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         self.processing_hooks.append(("complete", event.message_id, outcome))
 
 
+class DummyWeixinAdapter(DummyTelegramAdapter):
+    def __init__(self):
+        super().__init__()
+        self.platform = Platform.WEIXIN
+
+
 def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageEvent:
     return MessageEvent(
         text="hello",
@@ -106,6 +112,45 @@ class TestBasePlatformTopicSessions:
 
         assert scheduled == []
         assert adapter.get_pending_message(build_session_key(pending_event.source)) == pending_event
+
+    @pytest.mark.asyncio
+    async def test_weixin_text_followup_queues_without_interrupt(self, monkeypatch):
+        adapter = DummyWeixinAdapter()
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+
+        active_event = MessageEvent(
+            text="hello",
+            source=SessionSource(
+                platform=Platform.WEIXIN,
+                chat_id="wx-user-1",
+                chat_type="dm",
+                user_id="wx-user-1",
+            ),
+            message_id="1",
+        )
+        session_key = build_session_key(active_event.source)
+        interrupt_event = asyncio.Event()
+        adapter._active_sessions[session_key] = interrupt_event
+
+        scheduled = []
+
+        def fake_create_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return SimpleNamespace()
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+        pending_event = MessageEvent(
+            text="follow up",
+            source=active_event.source,
+            message_id="2",
+        )
+        await adapter.handle_message(pending_event)
+
+        assert scheduled == []
+        assert adapter.get_pending_message(session_key) == pending_event
+        assert interrupt_event.is_set() is False
 
     @pytest.mark.asyncio
     async def test_process_message_background_replies_in_same_topic(self):

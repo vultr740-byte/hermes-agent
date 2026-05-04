@@ -214,6 +214,32 @@ class TestWeixinConfig:
 
         assert config.get_connected_platforms() == []
 
+    def test_adapter_restores_latest_saved_state_without_env_credentials(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("WEIXIN_ACCOUNT_ID", raising=False)
+        monkeypatch.delenv("WEIXIN_TOKEN", raising=False)
+        monkeypatch.delenv("WEIXIN_BASE_URL", raising=False)
+
+        accounts_dir = tmp_path / "weixin" / "accounts"
+        accounts_dir.mkdir(parents=True, exist_ok=True)
+        (accounts_dir / "restored-account.json").write_text(
+            json.dumps(
+                {
+                    "token": "restored-token",
+                    "base_url": "https://restored.example.com",
+                    "user_id": "user-1",
+                    "saved_at": "2026-04-13T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        adapter = WeixinAdapter(PlatformConfig(enabled=True))
+
+        assert adapter._account_id == "restored-account"
+        assert adapter._token == "restored-token"
+        assert adapter._base_url == "https://restored.example.com"
+
 
 class TestWeixinStatePersistence:
     def test_save_weixin_account_preserves_existing_file_on_replace_failure(self, tmp_path, monkeypatch):

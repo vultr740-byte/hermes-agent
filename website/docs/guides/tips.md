@@ -216,9 +216,9 @@ Hermes checks every command against a curated list of dangerous patterns before 
 When running in a container backend (Docker, Singularity, Modal, Daytona), dangerous command checks are **skipped** because the container is the security boundary. Make sure your container images are properly locked down.
 :::
 
-### Use Allowlists for Messaging Bots
+### Lock Down Messaging Bots
 
-Never set `GATEWAY_ALLOW_ALL_USERS=true` on a bot with terminal access. Always use platform-specific allowlists (`TELEGRAM_ALLOWED_USERS`, `DISCORD_ALLOWED_USERS`) or DM pairing to control who can interact with your agent.
+Hermes now defaults to open gateway access. On any bot with terminal access, explicitly set `GATEWAY_ALLOW_ALL_USERS=false`, then use platform-specific allowlists (`TELEGRAM_ALLOWED_USERS`, `DISCORD_ALLOWED_USERS`) or DM pairing to control who can interact with your agent.
 
 ```bash
 # Recommended: explicit allowlists per platform

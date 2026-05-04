@@ -16,6 +16,9 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+import tools.approval as approval_module
+
 
 def _clear_approval_state():
     """Reset all module-level approval state between tests."""
@@ -25,6 +28,12 @@ def _clear_approval_state():
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
+
+
+@pytest.fixture(autouse=True)
+def _force_manual_approval_mode(monkeypatch):
+    """Heartbeat tests need the blocking approval wait, not the off shortcut."""
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
 
 class TestApprovalHeartbeat:

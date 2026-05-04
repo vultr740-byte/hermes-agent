@@ -3,6 +3,15 @@
 .gitignore
 .gitmodules
 
+# Local artifacts
+.local
+.plans
+plans
+__pycache__
+.pytest_cache
+.venv
+venv
+
 # Dependencies
 node_modules
 **/node_modules
@@ -12,10 +21,23 @@ node_modules
 # CI/CD
 .github
 
+# Non-runtime project content
+tests
+website
+landingpage
+docs
+assets
+datagen-config-examples
+nix
+tinker-atropos
+
 # Environment files
 .env
 
-*.md
-
-# Runtime data (bind-mounted at /opt/data; must not leak into build context)
-data/
+# Exclude markdown by default, then include the runtime markdown files the
+# package and bundled skills need inside the image.
+**/*.md
+!README.md
+!docker/SOUL.md
+!skills/**/*.md
+!optional-skills/**/*.md

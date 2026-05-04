@@ -519,8 +519,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
-    # --- Weixin: use the native one-shot adapter helper for text + media ---
-    if platform == Platform.WEIXIN:
+    # --- Weixin: media attachments still use the native helper; plain-text
+    # direct sends stay disabled and must go through a live gateway session.
+    if platform == Platform.WEIXIN and media_files:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
 
     # --- Discord: special handling for media attachments ---
@@ -609,6 +610,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.WEIXIN:
+            result = _error(
+                "Direct send_message delivery is not supported for weixin. "
+                "Use the running gateway adapter or a configured home channel delivery instead."
+            )
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.weixin import save_weixin_account_state
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -28,6 +29,7 @@ def _clear_auth_env(monkeypatch) -> None:
         "TELEGRAM_ALLOW_ALL_USERS",
         "DISCORD_ALLOW_ALL_USERS",
         "WHATSAPP_ALLOW_ALL_USERS",
+        "WEIXIN_ALLOW_ALL_USERS",
         "SLACK_ALLOW_ALL_USERS",
         "SIGNAL_ALLOW_ALL_USERS",
         "EMAIL_ALLOW_ALL_USERS",
@@ -68,6 +70,9 @@ def _make_runner(platform: Platform, config: GatewayConfig):
     # Attributes required by _handle_message for the authorized-user path
     runner._running_agents = {}
     runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._update_prompt_pending = {}
+    runner._draining = False
     runner._update_prompts = {}
     runner.hooks = SimpleNamespace(dispatch=AsyncMock(return_value=None))
     runner._sessions = {}
@@ -355,8 +360,39 @@ def test_telegram_group_users_mixed_sender_and_legacy_chat(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_dm_pairs_by_default(monkeypatch):
+async def test_dm_is_authorized_by_default_without_allowlists(monkeypatch):
     _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.WHATSAPP, config)
+    called = False
+
+    async def _stop_after_auth(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return "authorized"
+
+    runner._handle_message_with_agent = _stop_after_auth
+
+    result = await runner._handle_message(
+        _make_event(
+            Platform.WHATSAPP,
+            "15551234567@s.whatsapp.net",
+            "15551234567@s.whatsapp.net",
+        )
+    )
+
+    assert result == "authorized"
+    assert called is True
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_gateway_allow_all_false_restores_pairing(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
     )
@@ -382,8 +418,44 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_weixin_saved_login_state_authorizes_own_account_when_gateway_is_closed(monkeypatch, tmp_path):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    save_weixin_account_state(
+        {
+            "account_id": "wxid_hermes_bot",
+            "bot_token": "weixin-token",
+            "base_url": "https://wx.example.com",
+            "user_id": "wxid_owner_1",
+        },
+        hermes_home=str(tmp_path),
+    )
+
+    config = GatewayConfig(
+        platforms={Platform.WEIXIN: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.WEIXIN, config)
+    runner._handle_message_with_agent = AsyncMock(return_value="authorized")
+
+    result = await runner._handle_message(
+        _make_event(
+            Platform.WEIXIN,
+            "wxid_owner_1",
+            "wxid_owner_1",
+        )
+    )
+
+    assert result == "authorized"
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
     _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
     config = GatewayConfig(
         platforms={
             Platform.WHATSAPP: PlatformConfig(
@@ -411,6 +483,7 @@ async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
 async def test_rate_limited_user_gets_no_response(monkeypatch):
     """When a user is already rate-limited, pairing messages are silently ignored."""
     _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
     )
@@ -435,6 +508,7 @@ async def test_rejection_message_records_rate_limit(monkeypatch):
     """After sending a 'too many requests' rejection, rate limit is recorded
     so subsequent messages are silently ignored."""
     _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
     )
@@ -460,6 +534,7 @@ async def test_rejection_message_records_rate_limit(monkeypatch):
 @pytest.mark.asyncio
 async def test_global_ignore_suppresses_pairing_reply(monkeypatch):
     _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
     config = GatewayConfig(
         unauthorized_dm_behavior="ignore",
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
@@ -551,24 +626,29 @@ async def test_global_allowlist_ignores_unauthorized_dm(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_no_allowlist_still_pairs_by_default(monkeypatch):
-    """Without any allowlist, pairing behavior is preserved (open gateway)."""
+    """Without any allowlist, users are authorized by default on open gateways."""
     _clear_auth_env(monkeypatch)
-    # No SIGNAL_ALLOWED_USERS, no GATEWAY_ALLOWED_USERS
-
     config = GatewayConfig(
         platforms={Platform.SIGNAL: PlatformConfig(enabled=True)},
     )
     runner, adapter = _make_runner(Platform.SIGNAL, config)
-    runner.pairing_store.generate_code.return_value = "PAIR1234"
+    called = False
+
+    async def _stop_after_auth(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return "authorized"
+
+    runner._handle_message_with_agent = _stop_after_auth
 
     result = await runner._handle_message(
         _make_event(Platform.SIGNAL, "+15559999999", "+15559999999")
     )
 
-    assert result is None
-    runner.pairing_store.generate_code.assert_called_once()
-    adapter.send.assert_awaited_once()
-    assert "PAIR1234" in adapter.send.await_args.args[1]
+    assert result == "authorized"
+    assert called is True
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_not_awaited()
 
 
 def test_explicit_pair_config_overrides_allowlist_default(monkeypatch):

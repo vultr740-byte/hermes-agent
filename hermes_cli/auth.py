@@ -1154,10 +1154,11 @@ def resolve_provider(
 
     Priority (when requested="auto" or None):
     1. active_provider in auth.json with valid credentials
-    2. Explicit CLI api_key/base_url -> "openrouter"
-    3. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
-    4. Provider-specific API keys (GLM, Kimi, MiniMax) -> that provider
-    5. Fallback: "openrouter"
+    2. Explicit CLI base_url -> "custom"; explicit CLI api_key -> "openrouter"
+    3. OPENAI_BASE_URL env var -> "custom"
+    4. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
+    5. Provider-specific API keys (GLM, Kimi, MiniMax) -> that provider
+    6. Fallback: "openrouter"
     """
     normalized = (requested or "auto").strip().lower()
 
@@ -1213,8 +1214,11 @@ def resolve_provider(
             msg += " Check 'hermes model' for available providers, or run 'hermes doctor' to diagnose config issues."
         raise AuthError(msg, code="invalid_provider")
 
-    # Explicit one-off CLI creds always mean openrouter/custom
-    if explicit_api_key or explicit_base_url:
+    # Explicit one-off CLI routing: base_url means a custom OpenAI-compatible
+    # endpoint; api_key-only falls back to OpenRouter-style routing.
+    if explicit_base_url:
+        return "custom"
+    if explicit_api_key:
         return "openrouter"
 
     # Check auth store for an active OAuth provider
@@ -1227,6 +1231,9 @@ def resolve_provider(
                 return active
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
+
+    if os.getenv("OPENAI_BASE_URL", "").strip():
+        return "custom"
 
     if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"

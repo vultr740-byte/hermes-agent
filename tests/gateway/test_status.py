@@ -334,6 +334,25 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_write_runtime_status_clears_stale_error_fields_on_connected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            platform="weixin",
+            platform_state="fatal",
+            error_code="weixin_missing_credentials",
+            error_message="missing login",
+        )
+        status.write_runtime_status(
+            platform="weixin",
+            platform_state="connected",
+        )
+
+        payload = status.read_runtime_status()
+        assert payload["platforms"]["weixin"]["state"] == "connected"
+        assert "error_code" not in payload["platforms"]["weixin"]
+        assert "error_message" not in payload["platforms"]["weixin"]
+
 
 class TestTerminatePid:
     def test_force_uses_taskkill_on_windows(self, monkeypatch):

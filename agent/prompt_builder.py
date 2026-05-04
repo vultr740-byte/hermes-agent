@@ -401,6 +401,12 @@ PLATFORM_HINTS = {
         "files arrive as downloadable documents. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as photos."
     ),
+    "weixin": (
+        "You are on a text messaging communication platform, Weixin. "
+        "Please do not use markdown as it does not render. "
+        "Keep replies concise, direct, and plain text. "
+        "Assume the current integration is optimized for direct-message chat."
+    ),
     "email": (
         "You are communicating via email. Write clear, well-structured responses "
         "suitable for email. Use plain text formatting (no markdown). "

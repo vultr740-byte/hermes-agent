@@ -5,6 +5,7 @@
 __pycache__/
 .venv/
 .vscode/
+.DS_Store
 .env
 .env.local
 .env.development.local
@@ -51,6 +52,8 @@ skills/.hub/
 ignored/
 .worktrees/
 environments/benchmarks/evals/
+/.local/
+.railway/
 
 # Web UI build output
 hermes_cli/web_dist/

@@ -1550,6 +1550,92 @@ def cmd_whatsapp(args):
         print("⚠ Pairing may not have completed. Run 'hermes whatsapp' to try again.")
 
 
+def cmd_weixin(args):
+    """Set up Weixin personal account login via QR code."""
+    _require_tty("weixin")
+    import time
+    try:
+        import qrcode
+    except ImportError:
+        qrcode = None
+
+    from hermes_cli.config import get_env_value, save_env_value
+    from gateway.platforms.weixin import (
+        load_weixin_account_state,
+        save_weixin_account_state,
+        start_weixin_qr_login,
+        wait_for_weixin_login,
+    )
+
+    print()
+    print("Weixin Setup")
+    print("=" * 50)
+
+    existing = load_weixin_account_state()
+    if existing and existing.get("bot_token"):
+        print()
+        print(f"✓ Existing Weixin session found: {existing.get('account_id') or '(unknown account)'}")
+        try:
+            response = input("  Re-login and replace it? [y/N] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            response = "n"
+        if response.lower() not in ("y", "yes"):
+            print("  Keeping existing session.")
+            return
+
+    print()
+    print("Requesting login QR code...")
+    start = start_weixin_qr_login()
+    qr_url = start.get("qr_url") or ""
+    session_key = start.get("session_key") or ""
+    if not qr_url or not session_key:
+        print(f"✗ Failed to start Weixin login: {start.get('message') or 'unknown error'}")
+        return
+
+    print()
+    print("Scan this QR code with WeChat:")
+    print()
+    if qrcode:
+        try:
+            qr = qrcode.QRCode(border=1)
+            qr.add_data(qr_url)
+            qr.make(fit=True)
+            qr.print_ascii(invert=True)
+        except Exception:
+            pass
+    print(qr_url)
+    print()
+    print("Waiting for confirmation in WeChat...")
+
+    result = wait_for_weixin_login(session_key=session_key, timeout_ms=480000, verbose=True)
+    print()
+
+    if not result.get("connected"):
+        print(f"✗ Weixin login failed: {result.get('message') or 'unknown error'}")
+        return
+
+    save_weixin_account_state(
+        {
+            "account_id": result.get("account_id"),
+            "bot_token": result.get("bot_token"),
+            "base_url": result.get("base_url"),
+            "user_id": result.get("user_id"),
+            "updated_at": int(time.time()),
+        }
+    )
+    print("✓ Weixin paired successfully!")
+    print("✓ Weixin will auto-enable whenever this login state exists")
+    print()
+    print("Next steps:")
+    print("  1. Start the gateway:  hermes gateway")
+    print("  2. Send a direct message to the connected Weixin account")
+    print("  3. Hermes will reply in that Weixin chat")
+    if result.get("user_id"):
+        print()
+        print(f"Detected your Weixin user ID: {result['user_id']}")
+        print("This account is authorized automatically from the saved login state.")
+
+
 def cmd_setup(args):
     """Interactive setup wizard."""
     from hermes_cli.setup import run_setup_wizard
@@ -7565,6 +7651,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "gateway",
         "setup",
         "whatsapp",
+        "weixin",
         "login",
         "logout",
         "auth",
@@ -8369,6 +8456,15 @@ def main():
              "into an existing manifest manually).",
     )
     slack_parser.set_defaults(func=cmd_slack)
+
+    # weixin command
+    # =========================================================================
+    weixin_parser = subparsers.add_parser(
+        "weixin",
+        help="Set up Weixin integration",
+        description="Configure personal Weixin login and pair via QR code"
+    )
+    weixin_parser.set_defaults(func=cmd_weixin)
 
     # =========================================================================
     # login command

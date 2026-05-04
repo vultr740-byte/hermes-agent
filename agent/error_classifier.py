@@ -91,6 +91,7 @@ class ClassifiedError:
 # Patterns that indicate billing exhaustion (not transient rate limit)
 _BILLING_PATTERNS = [
     "insufficient credits",
+    "insufficient balance",
     "insufficient_quota",
     "insufficient balance",
     "credit balance",

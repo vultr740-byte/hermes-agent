@@ -315,6 +315,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/api/weixin/account", adapter._handle_weixin_account)
+    app.router.add_post("/api/weixin/login/start", adapter._handle_weixin_login_start)
+    app.router.add_get("/api/weixin/login/status", adapter._handle_weixin_login_status)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -520,6 +523,99 @@ class TestModelsEndpoint:
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200
+
+
+class TestWeixinLoginEndpoints:
+    @pytest.mark.asyncio
+    async def test_weixin_account_reports_disconnected(self, monkeypatch, tmp_path, adapter):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/weixin/account")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["connected"] is False
+            assert data["account_id"] == ""
+
+    @pytest.mark.asyncio
+    async def test_weixin_login_start_returns_qr(self, adapter):
+        app = _create_app(adapter)
+
+        with patch(
+            "gateway.platforms.weixin.start_weixin_qr_login",
+        ) as mock_start:
+            mock_start.return_value = {
+                "session_key": "sess-1",
+                "qr_url": "https://wx.example.com/qr.png",
+                "message": "ok",
+            }
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/weixin/login/start", json={"force": True})
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["session_key"] == "sess-1"
+                assert data["qr_url"] == "https://wx.example.com/qr.png"
+
+    @pytest.mark.asyncio
+    async def test_weixin_login_start_spawns_background_completion_task(self, adapter):
+        app = _create_app(adapter)
+        adapter.gateway_runner = MagicMock()
+        adapter._complete_weixin_login_in_background = AsyncMock()
+
+        with patch("gateway.platforms.weixin.start_weixin_qr_login") as mock_start:
+            mock_start.return_value = {
+                "session_key": "sess-1",
+                "qr_url": "https://wx.example.com/qr.png",
+                "message": "ok",
+            }
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/weixin/login/start", json={"force": True})
+                assert resp.status == 200
+
+        await asyncio.sleep(0)
+        adapter._complete_weixin_login_in_background.assert_awaited_once_with("sess-1")
+
+    @pytest.mark.asyncio
+    async def test_weixin_login_status_persists_account(self, monkeypatch, tmp_path, adapter):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        app = _create_app(adapter)
+        adapter.gateway_runner = MagicMock()
+        adapter.gateway_runner.reconnect_platform = AsyncMock(return_value=True)
+
+        with patch(
+            "gateway.platforms.weixin.check_weixin_login_status",
+        ) as mock_status:
+            mock_status.return_value = {
+                "connected": True,
+                "bot_token": "wx-token",
+                "account_id": "bot-1",
+                "base_url": "https://wx.example.com",
+                "user_id": "user-1",
+                "message": "connected",
+            }
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/weixin/login/status?session_key=sess-1&timeout_ms=1000")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["connected"] is True
+                assert data["account"]["connected"] is True
+                assert data["account"]["account_id"] == "bot-1"
+                mock_status.assert_called_once_with(session_key="sess-1", timeout_ms=1000)
+                adapter.gateway_runner.reconnect_platform.assert_awaited_once_with(Platform.WEIXIN)
+
+        from gateway.platforms.weixin import load_weixin_account_state
+
+        state = load_weixin_account_state()
+        assert state["account_id"] == "bot-1"
+        assert state["bot_token"] == "wx-token"
+
+    @pytest.mark.asyncio
+    async def test_weixin_endpoints_require_auth_when_key_set(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/weixin/account")
+            assert resp.status == 401
 
 
 # ---------------------------------------------------------------------------

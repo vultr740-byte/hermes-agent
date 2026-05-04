@@ -84,6 +84,64 @@ For the full command lists, see the [CLI guide](https://hermes-agent.nousresearc
 
 ---
 
+## Railway: Telegram First
+
+For Railway, the cleanest first deployment is a single Hermes gateway service with Telegram enabled.
+
+Recommended mode:
+- Start with Telegram polling. It does not require public HTTP ingress and is the least fragile Railway setup.
+- Switch to Telegram webhook only if you specifically want Telegram to deliver updates to your Railway domain.
+
+Minimal Railway setup:
+- Attach a persistent volume at `/opt/data`
+- Deploy from this repo with the container `Dockerfile.railway`
+- Set the required variables below
+- Let the container default command run the gateway in the foreground
+
+Why `Dockerfile.railway`:
+- It is a Railway-focused gateway image for Telegram/Weixin-first deployments.
+- It avoids the heavier browser and Node.js layers from the full development image, which keeps builds smaller and more reliable on Railway.
+
+Required variables:
+
+```bash
+HERMES_ENABLED_CHANNEL=telegram
+TELEGRAM_BOT_TOKEN=123456:ABCDEF...
+TELEGRAM_ALLOWED_USERS=123456789
+```
+
+Choose one inference option:
+
+```bash
+# OpenRouter
+OPENROUTER_API_KEY=...
+
+# Or any OpenAI-compatible endpoint
+OPENAI_BASE_URL=https://your-endpoint.example/v1
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-5.4-mini
+```
+
+Recommended variables:
+
+```bash
+HERMES_HOME=/opt/data
+```
+
+Webhook mode notes:
+- By default, Telegram runs in polling mode.
+- To use webhook mode on Railway, set `TELEGRAM_WEBHOOK_URL`.
+- If Railway exposes your app on `PORT=8080`, set `TELEGRAM_WEBHOOK_PORT=8080`.
+- If you use an OpenAI-compatible endpoint, set `OPENAI_MODEL` to a model returned by `<OPENAI_BASE_URL>/models`.
+- When `OPENAI_MODEL` is unset, the container will try to discover a model from `<OPENAI_BASE_URL>/models`. If your endpoint does not expose that route, set `OPENAI_MODEL` explicitly.
+
+Security notes:
+- `TELEGRAM_ALLOWED_USERS` should contain your numeric Telegram user ID, comma-separated for multiple users.
+- `TELEGRAM_HOME_CHANNEL` is optional. If you want this chat to receive cron results and cross-platform deliveries, send `/sethome` to the bot once after it starts.
+- If you omit allowlists, unauthorized users can still hit the DM pairing flow depending on your gateway config. For a first Railway deployment, explicit allowlists are the safer default.
+
+---
+
 ## Documentation
 
 All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:

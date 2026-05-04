@@ -266,6 +266,99 @@ class TestRunBackgroundTask:
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_billing_failure_sends_recharge_guidance(self, monkeypatch):
+        """Billing failures should surface a friendly top-up message."""
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(
+            return_value=([], "⚠️ 模型余额不足，请充值后重试。\nhttps://www.xialiao.app/recharge/demo_target")
+        )
+        mock_adapter.extract_images = MagicMock(
+            return_value=([], "⚠️ 模型余额不足，请充值后重试。\nhttps://www.xialiao.app/recharge/demo_target")
+        )
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        monkeypatch.setenv("RECHARGE_TARGET", "demo_target")
+
+        mock_result = {
+            "final_response": "",
+            "messages": [],
+            "error": "Payment Required: insufficient credits",
+        }
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.run_conversation.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        assert mock_adapter.send.call_count == 2
+        first_call = mock_adapter.send.call_args_list[0]
+        second_call = mock_adapter.send.call_args_list[1]
+        first_content = first_call[1].get("content", first_call[0][1] if len(first_call[0]) > 1 else "")
+        second_content = second_call[1].get("content", second_call[0][1] if len(second_call[0]) > 1 else "")
+        assert "Background task complete" in first_content
+        assert "模型余额不足" in first_content
+        assert second_content == "https://www.xialiao.app/recharge/demo_target"
+
+    @pytest.mark.asyncio
+    async def test_retry_exhausted_billing_failure_sends_recharge_guidance(self, monkeypatch):
+        """Retry-exhausted 402 failures should still surface a friendly top-up message."""
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(
+            return_value=([], "⚠️ 模型余额不足，请充值后重试。")
+        )
+        mock_adapter.extract_images = MagicMock(
+            return_value=([], "⚠️ 模型余额不足，请充值后重试。")
+        )
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        monkeypatch.setenv("RECHARGE_TARGET", "demo_target")
+
+        mock_result = {
+            "final_response": "API call failed after 3 retries: HTTP 402: Error code: 402 - {'detail': 'insufficient balance'}",
+            "messages": [],
+            "error": "HTTP 402: Error code: 402 - {'detail': 'insufficient balance'}",
+            "failed": True,
+        }
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.run_conversation.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        assert mock_adapter.send.call_count == 2
+        first_call = mock_adapter.send.call_args_list[0]
+        second_call = mock_adapter.send.call_args_list[1]
+        first_content = first_call[1].get("content", first_call[0][1] if len(first_call[0]) > 1 else "")
+        second_content = second_call[1].get("content", second_call[0][1] if len(second_call[0]) > 1 else "")
+        assert "Background task complete" in first_content
+        assert "模型余额不足" in first_content
+        assert second_content == "https://www.xialiao.app/recharge/demo_target"
+
+    @pytest.mark.asyncio
     async def test_exception_sends_error_message(self):
         """When the agent raises an exception, an error message is sent."""
         runner = _make_runner()

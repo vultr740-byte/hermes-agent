@@ -352,8 +352,8 @@ async def test_none_user_id_does_not_generate_pairing_code(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp_path):
-    """Verify the normal (non-internal) path still triggers pairing for unknown users."""
+async def test_non_internal_event_without_user_triggers_pairing_when_global_open_is_disabled(monkeypatch, tmp_path):
+    """Verify the normal path still triggers pairing after explicitly disabling global open access."""
     import gateway.run as gateway_run
     import gateway.pairing as pairing_mod
 
@@ -372,7 +372,7 @@ async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp
     # module-level dotenv in gateway/run.py from the real ~/.hermes/.env).
     monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
-    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
     monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
 
     runner = GatewayRunner(GatewayConfig())

@@ -57,6 +57,139 @@ fi
 # --- Running as hermes from here ---
 source "${INSTALL_DIR}/.venv/bin/activate"
 
+configure_custom_model_endpoint() {
+    if [ -z "${OPENAI_BASE_URL:-}" ]; then
+        return 0
+    fi
+
+    export HERMES_HOME
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+import yaml
+
+
+def load_config(path: Path):
+    if not path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def fetch_models(base_url: str, api_key: str) -> list[str]:
+    normalized = base_url.rstrip("/")
+    candidate_bases = [normalized]
+    if normalized.endswith("/v1"):
+        parent = normalized[:-3].rstrip("/")
+        if parent:
+            candidate_bases.append(parent)
+    else:
+        candidate_bases.append(normalized + "/v1")
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    last_error = None
+
+    for candidate_base in dict.fromkeys(candidate_bases):
+        url = candidate_base.rstrip("/") + "/models"
+        request = Request(url, headers=headers)
+        try:
+            with urlopen(request, timeout=10) as response:
+                payload = json.load(response)
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            last_error = (url, exc)
+            continue
+
+        models = []
+        for item in payload.get("data", []):
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or "").strip()
+            if model_id:
+                models.append(model_id)
+        if models:
+            return models
+
+    if last_error:
+        url, exc = last_error
+        print(f"[entrypoint] Warning: could not read {url}: {exc}")
+    return []
+
+
+config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+config = load_config(config_path)
+current_model = config.get("model")
+if isinstance(current_model, dict):
+    model_cfg = dict(current_model)
+elif isinstance(current_model, str) and current_model.strip():
+    model_cfg = {"default": current_model.strip()}
+else:
+    model_cfg = {}
+
+base_url = os.environ["OPENAI_BASE_URL"].strip().rstrip("/")
+api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+explicit_model = (
+    os.environ.get("OPENAI_MODEL", "").strip()
+)
+available_models = fetch_models(base_url, api_key)
+current_default = str(model_cfg.get("default") or "").strip()
+
+selected_model = explicit_model
+if not selected_model and available_models:
+    if current_default and current_default in available_models:
+        selected_model = current_default
+
+if not selected_model and available_models:
+    for candidate in (
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "gpt-5",
+        "gpt-5.1",
+        "gpt-5.1-codex-mini",
+        "gpt-5.1-codex",
+        "gpt-4o-mini",
+    ):
+        if candidate in available_models:
+            selected_model = candidate
+            break
+
+if not selected_model and available_models:
+    selected_model = available_models[0]
+
+if not selected_model and current_default and "/" not in current_default:
+    selected_model = current_default
+
+model_cfg["provider"] = "custom"
+model_cfg["base_url"] = base_url
+if selected_model:
+    model_cfg["default"] = selected_model
+else:
+    model_cfg.pop("default", None)
+    print(
+        "[entrypoint] Warning: could not auto-detect models from the custom endpoint. "
+        "Set OPENAI_MODEL if your endpoint does not expose /models."
+    )
+
+explicit_api_mode = os.environ.get("HERMES_API_MODE", "").strip()
+if explicit_api_mode:
+    model_cfg["api_mode"] = explicit_api_mode
+
+config["model"] = model_cfg
+config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+chosen = str(model_cfg.get("default") or "").strip() or "<unset>"
+print(f"[entrypoint] Configured custom model endpoint: {base_url} (model={chosen})")
+PY
+}
+
 # Create essential directory structure.  Cache and platform directories
 # (cache/images, cache/audio, platforms/whatsapp, etc.) are created on
 # demand by the application — don't pre-create them here so new installs
@@ -86,18 +219,7 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
-# Final exec: two supported invocation patterns.
-#
-#   docker run <image>                 -> exec `hermes` with no args (legacy default)
-#   docker run <image> chat -q "..."   -> exec `hermes chat -q "..."` (legacy wrap)
-#   docker run <image> sleep infinity  -> exec `sleep infinity` directly
-#   docker run <image> bash            -> exec `bash` directly
-#
-# If the first positional arg resolves to an executable on PATH, we assume the
-# caller wants to run it directly (needed by the launcher which runs long-lived
-# `sleep infinity` sandbox containers — see tools/environments/docker.py).
-# Otherwise we treat the args as a hermes subcommand and wrap with `hermes`,
-# preserving the documented `docker run <image> <subcommand>` behavior.
+configure_custom_model_endpoint
 if [ $# -gt 0 ] && command -v "$1" >/dev/null 2>&1; then
     exec "$@"
 fi

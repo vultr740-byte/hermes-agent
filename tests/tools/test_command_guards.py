@@ -52,6 +52,12 @@ def _clean_state():
         os.environ.pop(k, None)
 
 
+@pytest.fixture(autouse=True)
+def _force_manual_approval_mode(monkeypatch):
+    """Command-guard tests exercise approval flows, not the local off default."""
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+
+
 # ---------------------------------------------------------------------------
 # Container skip
 # ---------------------------------------------------------------------------

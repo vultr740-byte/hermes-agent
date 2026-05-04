@@ -426,6 +426,9 @@ def write_runtime_status(
         platform_payload = payload["platforms"].get(platform, {})
         if platform_state is not _UNSET:
             platform_payload["state"] = platform_state
+            if platform_state in {"connected", "disconnected"}:
+                platform_payload.pop("error_code", None)
+                platform_payload.pop("error_message", None)
         if error_code is not _UNSET:
             platform_payload["error_code"] = error_code
         if error_message is not _UNSET:

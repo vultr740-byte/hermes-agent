@@ -30,15 +30,15 @@ The approval system supports three modes, configured via `approvals.mode` in `~/
 
 ```yaml
 approvals:
-  mode: manual    # manual | smart | off
+  mode: off       # manual | smart | off
   timeout: 60     # seconds to wait for user response (default: 60)
 ```
 
 | Mode | Behavior |
 |------|----------|
-| **manual** (default) | Always prompt the user for approval on dangerous commands |
+| **manual** | Always prompt the user for approval on dangerous commands |
 | **smart** | Use an auxiliary LLM to assess risk. Low-risk commands (e.g., `python -c "print('hello')"`) are auto-approved. Genuinely dangerous commands are auto-denied. Uncertain cases escalate to a manual prompt. |
-| **off** | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts. |
+| **off** (default) | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts. |
 
 :::warning
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
@@ -199,7 +199,7 @@ The `_is_user_authorized()` method checks in this order:
 3. **Platform-specific allowlists** (e.g., `TELEGRAM_ALLOWED_USERS=12345,67890`)
 4. **Global allowlist** (`GATEWAY_ALLOWED_USERS=12345,67890`)
 5. **Global allow-all** (`GATEWAY_ALLOW_ALL_USERS=true`)
-6. **Default: deny**
+6. **Default: allow** unless `GATEWAY_ALLOW_ALL_USERS=false`
 
 ### Platform Allowlists
 
@@ -223,13 +223,7 @@ GATEWAY_ALLOW_ALL_USERS=true
 ```
 
 :::warning
-If **no allowlists are configured** and `GATEWAY_ALLOW_ALL_USERS` is not set, **all users are denied**. The gateway logs a warning at startup:
-
-```
-No user allowlists configured. All unauthorized users will be denied.
-Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access,
-or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id).
-```
+Hermes now defaults to open access when no allowlists are configured. To restore the old locked-down behavior, set `GATEWAY_ALLOW_ALL_USERS=false` and then configure platform allowlists or use DM pairing.
 :::
 
 ### DM Pairing System
@@ -252,7 +246,7 @@ whatsapp:
   unauthorized_dm_behavior: ignore
 ```
 
-- `pair` is the default. Unauthorized DMs get a pairing code reply.
+- `pair` is the default behavior for unauthorized DMs once a user is considered unauthorized.
 - `ignore` silently drops unauthorized DMs.
 - Platform sections override the global default, so you can keep pairing on Telegram while keeping WhatsApp silent.
 
@@ -559,7 +553,7 @@ Blocked files show a warning:
 
 ### Gateway Deployment Checklist
 
-1. **Set explicit allowlists** — never use `GATEWAY_ALLOW_ALL_USERS=true` in production
+1. **Explicitly disable global open access** — set `GATEWAY_ALLOW_ALL_USERS=false` in production before configuring allowlists or pairing
 2. **Use container backend** — set `terminal.backend: docker` in config.yaml
 3. **Restrict resource limits** — set appropriate CPU, memory, and disk limits
 4. **Store secrets securely** — keep API keys in `~/.hermes/.env` with proper file permissions

@@ -37,12 +37,43 @@ class StubAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class StubWeixinAdapter(BasePlatformAdapter):
+    """Minimal Weixin adapter for follow-up queue tests."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.WEIXIN)
+
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        return SendResult(success=True, message_id="1")
+
+    async def send_typing(self, chat_id, metadata=None):
+        pass
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
 def _source(chat_id="123456", chat_type="dm", thread_id=None):
     return SessionSource(
         platform=Platform.TELEGRAM,
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+    )
+
+
+def _weixin_source(chat_id="wx-user-1", chat_type="dm"):
+    return SessionSource(
+        platform=Platform.WEIXIN,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        user_id=chat_id,
     )
 
 
@@ -147,4 +178,26 @@ class TestInterruptKeyConsistency:
         queued = adapter._pending_messages[session_key]
         assert queued is event
         assert queued.media_urls == ["/tmp/photo-a.jpg"]
+        assert interrupt_event.is_set() is False
+
+    @pytest.mark.asyncio
+    async def test_weixin_text_followup_is_queued_without_interrupt(self):
+        """Weixin text follow-ups should not interrupt an in-flight reply."""
+        adapter = StubWeixinAdapter()
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+
+        source = _weixin_source("wx-user-2")
+        session_key = build_session_key(source)
+        interrupt_event = asyncio.Event()
+        adapter._active_sessions[session_key] = interrupt_event
+
+        event = MessageEvent(
+            text="second message",
+            source=source,
+            message_type=MessageType.TEXT,
+            message_id="wx-2",
+        )
+        await adapter.handle_message(event)
+
+        assert adapter._pending_messages[session_key] is event
         assert interrupt_event.is_set() is False

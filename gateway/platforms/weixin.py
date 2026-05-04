@@ -84,6 +84,8 @@ LONG_POLL_TIMEOUT_MS = 35_000
 API_TIMEOUT_MS = 15_000
 CONFIG_TIMEOUT_MS = 10_000
 QR_TIMEOUT_MS = 35_000
+QR_LOGIN_TTL_MS = 5 * 60_000
+QR_LOGIN_POLL_INTERVAL_SECONDS = 1.0
 
 MAX_CONSECUTIVE_FAILURES = 3
 RETRY_DELAY_SECONDS = 2
@@ -228,6 +230,59 @@ def _account_file(hermes_home: str, account_id: str) -> Path:
     return _account_dir(hermes_home) / f"{account_id}.json"
 
 
+def _weixin_root(hermes_home: str) -> Path:
+    path = Path(hermes_home) / "weixin"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _login_sessions_path(hermes_home: str) -> Path:
+    return _weixin_root(hermes_home) / "login_sessions.json"
+
+
+def _read_json_file(path: Path, default: Any) -> Any:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("weixin: failed to read JSON state %s", path, exc_info=True)
+    return default
+
+
+def _write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def _load_login_sessions(hermes_home: str) -> Dict[str, Any]:
+    data = _read_json_file(_login_sessions_path(hermes_home), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_login_sessions(hermes_home: str, sessions: Dict[str, Any]) -> None:
+    _write_json_file(_login_sessions_path(hermes_home), sessions)
+
+
+def _purge_expired_login_sessions(
+    hermes_home: str,
+    sessions: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    active = dict(sessions or _load_login_sessions(hermes_home))
+    now_ms = int(time.time() * 1000)
+    active = {
+        key: value
+        for key, value in active.items()
+        if now_ms - int((value or {}).get("started_at", 0)) < QR_LOGIN_TTL_MS
+    }
+    _save_login_sessions(hermes_home, active)
+    return active
+
+
 def save_weixin_account(
     hermes_home: str,
     *,
@@ -260,6 +315,295 @@ def load_weixin_account(hermes_home: str, account_id: str) -> Optional[Dict[str,
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def load_weixin_account_state(hermes_home: Optional[str] = None) -> Dict[str, Any]:
+    """Return the latest saved Weixin account state in a frontend-friendly shape."""
+    resolved_home = hermes_home or str(get_hermes_home())
+    accounts_dir = _account_dir(resolved_home)
+    account_files = sorted(
+        accounts_dir.glob("*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for path in account_files:
+        if path.name.endswith(".context-tokens.json"):
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        token = str(payload.get("token") or "").strip()
+        if not token:
+            continue
+        account_id = path.stem
+        return {
+            "connected": True,
+            "account_id": account_id,
+            "bot_token": token,
+            "base_url": str(payload.get("base_url") or "").strip(),
+            "user_id": str(payload.get("user_id") or "").strip(),
+            "updated_at": payload.get("saved_at"),
+        }
+
+    return {
+        "connected": False,
+        "account_id": "",
+        "bot_token": "",
+        "base_url": "",
+        "user_id": "",
+        "updated_at": None,
+    }
+
+
+def save_weixin_account_state(
+    data: Dict[str, Any],
+    hermes_home: Optional[str] = None,
+) -> None:
+    """Persist Weixin account state using the account-based storage model."""
+    resolved_home = hermes_home or str(get_hermes_home())
+    account_id = str(data.get("account_id") or "").strip()
+    token = str(data.get("bot_token") or data.get("token") or "").strip()
+    if not account_id or not token:
+        raise ValueError("account_id and bot_token are required")
+
+    save_weixin_account(
+        resolved_home,
+        account_id=account_id,
+        token=token,
+        base_url=str(data.get("base_url") or ILINK_BASE_URL).strip() or ILINK_BASE_URL,
+        user_id=str(data.get("user_id") or "").strip(),
+    )
+
+
+def start_weixin_qr_login(
+    *,
+    force: bool = False,
+    account_id: Optional[str] = None,
+    api_base_url: str = ILINK_BASE_URL,
+    bot_type: str = "3",
+    hermes_home: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Start a remote Weixin QR login session and persist pending QR metadata."""
+    resolved_home = hermes_home or str(get_hermes_home())
+    sessions = _purge_expired_login_sessions(resolved_home)
+    session_key = str(account_id or uuid.uuid4()).strip()
+
+    existing = sessions.get(session_key) or {}
+    if existing and not force and existing.get("qr_url"):
+        return {
+            "session_key": session_key,
+            "qr_url": existing.get("qr_url"),
+            "status": "wait",
+            "message": "QR code already active.",
+        }
+
+    async def _fetch() -> Dict[str, Any]:
+        async with aiohttp.ClientSession() as session:
+            return await _api_get(
+                session,
+                base_url=api_base_url,
+                endpoint=f"{EP_GET_BOT_QR}?bot_type={quote(str(bot_type), safe='')}",
+                timeout_ms=QR_TIMEOUT_MS,
+            )
+
+    try:
+        result = asyncio.run(_fetch())
+    except Exception as exc:
+        logger.warning("weixin: failed to fetch QR login start payload: %s", exc)
+        return {
+            "session_key": session_key,
+            "status": "error",
+            "message": "Failed to fetch Weixin QR code.",
+        }
+
+    qr_code = str(result.get("qrcode") or "").strip()
+    qr_url = str(result.get("qrcode_img_content") or "").strip()
+    if not qr_code or not qr_url:
+        return {
+            "session_key": session_key,
+            "status": "error",
+            "message": "Failed to fetch Weixin QR code.",
+        }
+
+    sessions[session_key] = {
+        "session_key": session_key,
+        "qrcode": qr_code,
+        "qr_url": qr_url,
+        "bot_type": str(bot_type),
+        "started_at": int(time.time() * 1000),
+        "current_api_base_url": str(api_base_url or ILINK_BASE_URL).strip().rstrip("/")
+        or ILINK_BASE_URL,
+    }
+    _save_login_sessions(resolved_home, sessions)
+    return {
+        "session_key": session_key,
+        "qr_url": qr_url,
+        "status": "wait",
+        "message": "Scan the QR code in WeChat to continue.",
+    }
+
+
+def check_weixin_login_status(
+    *,
+    session_key: str,
+    timeout_ms: int = QR_TIMEOUT_MS,
+    hermes_home: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Poll the remote QR session once and persist credentials on confirmation."""
+    resolved_home = hermes_home or str(get_hermes_home())
+    sessions = _purge_expired_login_sessions(resolved_home)
+    login = sessions.get(session_key)
+    if not login:
+        return {
+            "connected": False,
+            "status": "missing",
+            "message": "No active Weixin login session found.",
+        }
+
+    qrcode_value = str(login.get("qrcode") or "").strip()
+    current_base_url = (
+        str(login.get("current_api_base_url") or ILINK_BASE_URL).strip().rstrip("/")
+        or ILINK_BASE_URL
+    )
+    if not qrcode_value:
+        sessions.pop(session_key, None)
+        _save_login_sessions(resolved_home, sessions)
+        return {
+            "connected": False,
+            "status": "error",
+            "message": "Stored QR session is invalid.",
+        }
+
+    async def _poll() -> Dict[str, Any]:
+        async with aiohttp.ClientSession() as session:
+            return await _api_get(
+                session,
+                base_url=current_base_url,
+                endpoint=f"{EP_GET_QR_STATUS}?qrcode={quote(qrcode_value, safe='')}",
+                timeout_ms=max(int(timeout_ms), 1000),
+            )
+
+    try:
+        status_resp = asyncio.run(_poll())
+    except asyncio.TimeoutError:
+        return {
+            "connected": False,
+            "status": "wait",
+            "qr_url": login.get("qr_url"),
+            "message": "Waiting for QR confirmation.",
+        }
+    except Exception as exc:
+        logger.warning(
+            "weixin: QR status poll failed for %s: %s",
+            _safe_id(session_key),
+            exc,
+        )
+        return {
+            "connected": False,
+            "status": "wait",
+            "qr_url": login.get("qr_url"),
+            "message": "Waiting for QR confirmation.",
+        }
+
+    status = str(status_resp.get("status") or "wait").strip().lower()
+    if status == "scaned_but_redirect":
+        redirect_host = str(status_resp.get("redirect_host") or "").strip()
+        if redirect_host:
+            login["current_api_base_url"] = f"https://{redirect_host}"
+            sessions[session_key] = login
+            _save_login_sessions(resolved_home, sessions)
+        return {
+            "connected": False,
+            "status": status,
+            "qr_url": login.get("qr_url"),
+            "message": "QR scanned, waiting for confirmation.",
+        }
+
+    if status == "confirmed":
+        account_id = str(status_resp.get("ilink_bot_id") or "").strip()
+        token = str(status_resp.get("bot_token") or "").strip()
+        base_url = (
+            str(status_resp.get("baseurl") or current_base_url or ILINK_BASE_URL)
+            .strip()
+            .rstrip("/")
+            or ILINK_BASE_URL
+        )
+        user_id = str(status_resp.get("ilink_user_id") or "").strip()
+        if not account_id or not token:
+            return {
+                "connected": False,
+                "status": "error",
+                "qr_url": login.get("qr_url"),
+                "message": "Weixin confirmed login without complete credentials.",
+            }
+        save_weixin_account_state(
+            {
+                "account_id": account_id,
+                "bot_token": token,
+                "base_url": base_url,
+                "user_id": user_id,
+            },
+            hermes_home=resolved_home,
+        )
+        sessions.pop(session_key, None)
+        _save_login_sessions(resolved_home, sessions)
+        return {
+            "connected": True,
+            "status": status,
+            "account_id": account_id,
+            "bot_token": token,
+            "base_url": base_url,
+            "user_id": user_id,
+            "message": "Weixin connected.",
+        }
+
+    if status == "expired":
+        sessions.pop(session_key, None)
+        _save_login_sessions(resolved_home, sessions)
+        return {
+            "connected": False,
+            "status": status,
+            "message": "QR code expired. Start a new login session.",
+        }
+
+    return {
+        "connected": False,
+        "status": status or "wait",
+        "qr_url": login.get("qr_url"),
+        "message": "Waiting for QR confirmation.",
+    }
+
+
+def wait_for_weixin_login(
+    *,
+    session_key: str,
+    timeout_ms: int = 480_000,
+    hermes_home: Optional[str] = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Block until the QR session confirms or times out."""
+    deadline = time.time() + max(int(timeout_ms), 1000) / 1000.0
+    while time.time() < deadline:
+        remaining_ms = max(int((deadline - time.time()) * 1000), 1000)
+        result = check_weixin_login_status(
+            session_key=session_key,
+            timeout_ms=min(QR_TIMEOUT_MS, remaining_ms),
+            hermes_home=hermes_home,
+        )
+        if result.get("connected"):
+            return result
+        if result.get("status") in {"missing", "expired", "error"}:
+            return result
+        if verbose and result.get("message"):
+            print(f"\r{result.get('message')}   ", end="", flush=True)
+        time.sleep(QR_LOGIN_POLL_INTERVAL_SECONDS)
+
+    return {
+        "connected": False,
+        "status": "wait",
+        "message": "Weixin login timed out.",
+    }
 
 
 class ContextTokenStore:
@@ -1160,6 +1504,10 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("send_chunk_retry_delay_seconds")
             or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
         )
+        self._split_multiline_messages = _coerce_bool(
+            extra.get("split_multiline_messages") or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
+            default=False,
+        )
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
@@ -1176,6 +1524,18 @@ class WeixinAdapter(BasePlatformAdapter):
             default=False,
         )
 
+        if not self._account_id or not self._token:
+            latest_state = load_weixin_account_state(hermes_home)
+            if latest_state.get("connected"):
+                if not self._account_id:
+                    self._account_id = str(latest_state.get("account_id") or "").strip()
+                if not self._token:
+                    self._token = str(latest_state.get("bot_token") or "").strip()
+                if not extra.get("base_url") and not os.getenv("WEIXIN_BASE_URL"):
+                    self._base_url = (
+                        str(latest_state.get("base_url") or self._base_url).strip().rstrip("/")
+                    )
+
         if self._account_id and not self._token:
             persisted = load_weixin_account(hermes_home, self._account_id)
             if persisted:
@@ -1191,6 +1551,10 @@ class WeixinAdapter(BasePlatformAdapter):
         if isinstance(value, (list, tuple, set)):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
+
+    def supports_gateway_streaming(self) -> bool:
+        """Weixin has no message edit transport, so streaming feels fragmentary."""
+        return False
 
     async def connect(self) -> bool:
         if not check_weixin_requirements():
@@ -1504,7 +1868,9 @@ class WeixinAdapter(BasePlatformAdapter):
 
     def _split_text(self, content: str) -> List[str]:
         return _split_text_for_weixin_delivery(
-            content, self.MAX_MESSAGE_LENGTH, self._split_multiline_messages,
+            content,
+            self.MAX_MESSAGE_LENGTH,
+            split_per_line=self._split_multiline_messages,
         )
 
     async def _send_text_chunk(

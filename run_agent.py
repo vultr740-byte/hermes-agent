@@ -9161,6 +9161,57 @@ class AIAgent:
             "to change strategy instead of repeating the same call."
         )
 
+    def _latest_failed_tool_result_summary(self, messages: list) -> Optional[str]:
+        """Return a concise summary of the most recent failed tool result."""
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+
+            content = msg.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+
+            try:
+                data = json.loads(content)
+            except Exception:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            success = data.get("success")
+            error = data.get("error")
+            if success is not False and not error:
+                continue
+
+            tool_name = "tool"
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                for prior in reversed(messages):
+                    if not isinstance(prior, dict) or prior.get("role") != "assistant":
+                        continue
+                    tool_calls = prior.get("tool_calls") or []
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict) or tc.get("id") != tool_call_id:
+                            continue
+                        fn = tc.get("function")
+                        if isinstance(fn, dict):
+                            candidate = fn.get("name")
+                            if isinstance(candidate, str) and candidate.strip():
+                                tool_name = candidate.strip()
+                        break
+                    else:
+                        continue
+                    break
+
+            error_text = str(error or "The tool reported a failure.").strip()
+            error_type = data.get("error_type")
+            if isinstance(error_type, str) and error_type.strip():
+                return f"The last `{tool_name}` call failed ({error_type.strip()}): {error_text}"
+            return f"The last `{tool_name}` call failed: {error_text}"
+
+        return None
+
     def _append_guardrail_observation(
         self,
         tool_name: str,
@@ -12610,8 +12661,15 @@ class AIAgent:
                             )
                         else:
                             self._persist_session(messages, conversation_history)
+                        _tool_failure_summary = self._latest_failed_tool_result_summary(messages)
+                        _final_response = str(api_error)
+                        if _tool_failure_summary:
+                            _final_response = (
+                                f"{_tool_failure_summary}\n\n"
+                                f"The model also failed while following up on that tool result: {api_error}"
+                            )
                         return {
-                            "final_response": None,
+                            "final_response": _final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
@@ -12683,7 +12741,15 @@ class AIAgent:
                                 api_kwargs, reason="max_retries_exhausted", error=api_error,
                             )
                         self._persist_session(messages, conversation_history)
-                        _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
+                        _tool_failure_summary = self._latest_failed_tool_result_summary(messages)
+                        if _tool_failure_summary:
+                            _final_response = (
+                                f"{_tool_failure_summary}\n\n"
+                                f"The model also failed while following up on that tool result "
+                                f"after {max_retries} retries: {_final_summary}"
+                            )
+                        else:
+                            _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                         if _is_stream_drop:
                             _final_response += (
                                 "\n\nThe provider's stream connection keeps "
@@ -13513,7 +13579,19 @@ class AIAgent:
                                    ". No fallback providers configured.")
                             )
 
-                        final_response = "(empty)"
+                        _tool_failure_summary = self._latest_failed_tool_result_summary(messages)
+                        if _tool_failure_summary:
+                            logger.warning(
+                                "Model stayed empty after tool failure — surfacing "
+                                "last tool error directly"
+                            )
+                            self._emit_status(
+                                "⚠️ Model returned empty after tool failure — "
+                                "using the tool error as the final answer"
+                            )
+                            final_response = _tool_failure_summary
+                        else:
+                            final_response = "(empty)"
                         break
                     
                     # Reset retry counter/signature on successful content

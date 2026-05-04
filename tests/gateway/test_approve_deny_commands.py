@@ -20,6 +20,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+import tools.approval as approval_module
 
 
 def _make_source() -> SessionSource:
@@ -75,6 +76,12 @@ def _clear_approval_state():
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
+
+
+@pytest.fixture(autouse=True)
+def _force_manual_approval_mode(monkeypatch):
+    """Gateway approve/deny tests validate blocking approvals, not the off default."""
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
 
 # ------------------------------------------------------------------
@@ -402,7 +409,8 @@ class TestBlockingApprovalE2E:
         t = threading.Thread(target=agent_thread)
         t.start()
 
-        for _ in range(50):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
             if notified:
                 break
             time.sleep(0.05)
@@ -449,11 +457,13 @@ class TestBlockingApprovalE2E:
 
         t = threading.Thread(target=agent_thread)
         t.start()
-        for _ in range(50):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
             if notified:
                 break
             time.sleep(0.05)
 
+        assert len(notified) == 1
         resolve_gateway_approval(session_key, "deny")
         t.join(timeout=5)
 

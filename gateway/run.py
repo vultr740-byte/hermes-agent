@@ -191,6 +191,44 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+def _collect_new_turn_media_tags(
+    result_messages: Optional[List[Dict[str, Any]]],
+    *,
+    history_media_paths: Optional[set[str]] = None,
+) -> tuple[list[str], bool]:
+    """Collect unique MEDIA tags emitted by this turn's tool results.
+
+    Tool results may embed MEDIA tags inside JSON payload strings
+    (e.g. ``{"media_tag":"MEDIA:/tmp/out.png"}``) or as plain text.
+    We intentionally scan the raw tool content string for MEDIA lines so the
+    gateway can recover native media delivery even when the model never turns
+    the tool result into visible assistant text.
+    """
+    if not result_messages:
+        return [], False
+
+    seen_paths = set(history_media_paths or ())
+    collected: list[str] = []
+    has_voice_directive = False
+
+    for msg in result_messages:
+        if not isinstance(msg, dict) or msg.get("role") not in ("tool", "function"):
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str) or "MEDIA:" not in content:
+            continue
+        if "[[audio_as_voice]]" in content:
+            has_voice_directive = True
+        for match in re.finditer(r"MEDIA:\s*(\S+)", content):
+            path = match.group(1).strip().rstrip('",}')
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            collected.append(f"MEDIA:{path}")
+
+    return collected, has_voice_directive
+
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -250,6 +288,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
+from agent.billing_ui import BillingFailureResponse, format_billing_failure_response
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -262,6 +301,81 @@ load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve(
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
+
+def _billing_response_messages(response: BillingFailureResponse | None) -> list[str]:
+    """Flatten a structured billing response into ordered gateway messages."""
+    if not response:
+        return []
+    return response.as_messages()
+
+
+def _resolve_failed_response_text(
+    result: Dict[str, Any] | None,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> str | list[str]:
+    """Return a user-facing failed-response payload for gateway surfaces."""
+    if not result:
+        return ""
+
+    error_detail = result.get("error")
+    response_text = result.get("final_response") or ""
+    billing_error = error_detail or response_text
+
+    billing_response = format_billing_failure_response(
+        billing_error,
+        provider=provider,
+        model=model,
+    )
+    if billing_response:
+        return _billing_response_messages(billing_response)
+
+    if error_detail:
+        return f"Error: {error_detail}"
+    return response_text
+
+
+def _load_weixin_authorized_user_ids() -> set[str]:
+    """Return Weixin user IDs implicitly authorized by the saved login state."""
+    try:
+        from gateway.platforms.weixin import load_weixin_account_state
+
+        payload = load_weixin_account_state() or {}
+    except Exception:
+        return set()
+
+    ids = set()
+    for key in ("user_id", "ilink_user_id", "account_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            ids.add(value)
+    return ids
+
+
+def _is_truthy_flag(value: str) -> bool:
+    """Interpret common truthy strings used in env flags."""
+    return str(value or "").strip().lower() in ("true", "1", "yes", "on")
+
+
+def _is_falsy_flag(value: str) -> bool:
+    """Interpret common falsy strings used in env flags."""
+    return str(value or "").strip().lower() in ("false", "0", "no", "off")
+
+
+def _gateway_allow_all_enabled() -> bool:
+    """Return the effective global allow-all mode for gateway authorization.
+
+    Hermes now defaults to open access when no explicit authorization config is
+    provided. Operators can re-enable restricted mode by setting
+    ``GATEWAY_ALLOW_ALL_USERS=false`` and then supplying allowlists or pairing.
+    """
+    raw = os.getenv("GATEWAY_ALLOW_ALL_USERS", "")
+    if _is_falsy_flag(raw):
+        return False
+    if _is_truthy_flag(raw):
+        return True
+    return True
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -474,6 +588,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from .config import HomeChannel, PlatformConfig
 
 
 from gateway.whatsapp_identity import (
@@ -2466,15 +2581,15 @@ class GatewayRunner:
         _any_allowlist = any(
             os.getenv(v) for v in _builtin_allowed_vars + _plugin_allowed_vars
         )
-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
-            os.getenv(v, "").lower() in ("true", "1", "yes")
+        _allow_all = _gateway_allow_all_enabled() or any(
+            _is_truthy_flag(os.getenv(v, ""))
             for v in _builtin_allow_all_vars + _plugin_allow_all_vars
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
-                "No user allowlists configured. All unauthorized users will be denied. "
-                "Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access, "
-                "or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id)."
+                "No user allowlists configured. Gateway defaults to open access unless "
+                "GATEWAY_ALLOW_ALL_USERS=false is set. Configure platform allowlists "
+                "(e.g., TELEGRAM_ALLOWED_USERS=your_id) if you want restricted access."
             )
         
         # Discover Python plugins before shell hooks so plugin block
@@ -3719,6 +3834,53 @@ class GatewayRunner:
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
 
+    async def reconnect_platform(self, platform: Platform) -> bool:
+        """Attempt to connect a single platform immediately.
+
+        Used by runtime workflows that satisfy missing prerequisites after
+        startup, such as remote Weixin QR login storing fresh credentials.
+        """
+        platform_config = self.config.platforms.get(platform)
+        if not platform_config or not platform_config.enabled:
+            return False
+
+        existing = self.adapters.get(platform)
+        if existing:
+            try:
+                await existing.disconnect()
+            except Exception:
+                logger.debug("Failed disconnecting existing %s adapter before reconnect", platform.value, exc_info=True)
+            self.adapters.pop(platform, None)
+
+        adapter = self._create_adapter(platform, platform_config)
+        if not adapter:
+            return False
+
+        adapter.set_message_handler(self._handle_message)
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+
+        success = await adapter.connect()
+        if success:
+            self.adapters[platform] = adapter
+            self._sync_voice_mode_state_to_adapter(adapter)
+            self.delivery_router.adapters = self.adapters
+            self._failed_platforms.pop(platform, None)
+            try:
+                from gateway.channel_directory import build_channel_directory
+                await build_channel_directory(self.adapters)
+            except Exception:
+                pass
+            logger.info("✓ %s connected via explicit reconnect", platform.value)
+            return True
+
+        if adapter.has_fatal_error and adapter.fatal_error_retryable:
+            self._failed_platforms[platform] = {
+                "config": platform_config,
+                "attempts": 0,
+                "next_retry": time.monotonic() + 5,
+            }
+        return False
     def _create_adapter(
         self, 
         platform: Platform, 
@@ -3778,6 +3940,13 @@ class GatewayRunner:
                 logger.warning("WhatsApp: Node.js not installed or bridge not configured")
                 return None
             return WhatsAppAdapter(config)
+
+        elif platform == Platform.WEIXIN:
+            from gateway.platforms.weixin import WeixinAdapter, check_weixin_requirements
+            if not check_weixin_requirements():
+                logger.warning("Weixin: httpx/aiohttp not installed")
+                return None
+            return WeixinAdapter(config)
         
         elif platform == Platform.SLACK:
             from gateway.platforms.slack import SlackAdapter, check_slack_requirements
@@ -3871,7 +4040,9 @@ class GatewayRunner:
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            return APIServerAdapter(config)
+            adapter = APIServerAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
@@ -3913,7 +4084,7 @@ class GatewayRunner:
         2. Environment variable allowlists (TELEGRAM_ALLOWED_USERS, etc.)
         3. DM pairing approved list
         4. Global allow-all (GATEWAY_ALLOW_ALL_USERS=true)
-        5. Default: deny
+        5. Default: allow unless GATEWAY_ALLOW_ALL_USERS is explicitly false
         """
         # Home Assistant events are system-generated (state changes), not
         # user-initiated messages.  The HASS_TOKEN already authenticates the
@@ -3957,6 +4128,7 @@ class GatewayRunner:
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
             Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
+            Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
             Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
             Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
@@ -3993,7 +4165,7 @@ class GatewayRunner:
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
+        if platform_allow_all_var and _is_truthy_flag(os.getenv(platform_allow_all_var, "")):
             return True
 
         if getattr(source, "is_bot", False):
@@ -4018,6 +4190,13 @@ class GatewayRunner:
         if self.pairing_store.is_approved(platform_name, user_id):
             return True
 
+        if source.platform == Platform.WEIXIN:
+            weixin_ids = _load_weixin_authorized_user_ids()
+            if user_id in weixin_ids:
+                return True
+            if source.chat_id and str(source.chat_id) in weixin_ids:
+                return True
+
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
         group_user_allowlist = ""
@@ -4028,8 +4207,9 @@ class GatewayRunner:
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
-            # No allowlists configured -- check global allow-all flag
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+            # No allowlists configured -- default to open access unless the
+            # operator explicitly disabled it with GATEWAY_ALLOW_ALL_USERS=false.
+            return _gateway_allow_all_enabled()
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
@@ -4104,6 +4284,11 @@ class GatewayRunner:
             normalized_user_id = _normalize_whatsapp_identifier(user_id)
             if normalized_user_id:
                 check_ids.add(normalized_user_id)
+
+        # Weixin sender IDs are plain ilink user IDs; allow chat_id/account-style
+        # aliases by checking both user_id and chat_id when they differ.
+        if source.platform == Platform.WEIXIN and source.chat_id and source.chat_id != user_id:
+            check_ids.add(str(source.chat_id))
 
         return bool(check_ids & allowed_ids)
 
@@ -5807,30 +5992,32 @@ class GatewayRunner:
                 "Keep the introduction concise -- one or two sentences max.]"
             )
         
-        # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+        # First DM auto-becomes the home channel when none is configured yet.
+        # This removes the /sethome setup step while avoiding surprising
+        # defaults for groups/channels, which still require explicit setup.
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    # Slack dispatches all Hermes commands through a single
-                    # parent slash command `/hermes`; bare `/sethome` is not
-                    # registered and would fail with "app did not respond".
-                    sethome_cmd = (
-                        "/hermes sethome"
-                        if source.platform == Platform.SLACK
-                        else "/sethome"
-                    )
-                    await adapter.send(
-                        source.chat_id,
-                        f"📬 No home channel is set for {platform_name.title()}. "
-                        f"A home channel is where Hermes delivers cron job results "
-                        f"and cross-platform messages.\n\n"
-                        f"Type {sethome_cmd} to make this chat your home channel, "
-                        f"or ignore to skip."
-                    )
+                if source.chat_type == "dm":
+                    try:
+                        self._save_home_channel(
+                            source.platform,
+                            source.chat_id,
+                            source.chat_name or source.chat_id,
+                        )
+                        logger.info(
+                            "Auto-set %s home channel to %s on first DM",
+                            platform_name,
+                            source.chat_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to auto-set %s home channel for %s: %s",
+                            platform_name,
+                            source.chat_id,
+                            e,
+                        )
         
         # -----------------------------------------------------------------
         # Voice channel awareness — inject current voice channel state
@@ -5963,9 +6150,14 @@ class GatewayRunner:
                     )
 
             # Surface error details when the agent failed silently (final_response=None)
-            if not response and agent_result.get("failed"):
-                error_detail = agent_result.get("error", "unknown error")
+            if agent_result.get("failed"):
+                error_detail = agent_result.get("error") or agent_result.get("final_response") or "unknown error"
                 error_str = str(error_detail).lower()
+                billing_response = format_billing_failure_response(
+                    error_detail,
+                    provider=getattr(self, "_provider", "") or "",
+                    model=getattr(self, "_model", "") or "",
+                )
 
                 # Detect context-overflow failures and give specific guidance.
                 # Generic 400 "Error" from Anthropic with large sessions is the
@@ -5978,13 +6170,15 @@ class GatewayRunner:
                     and len(history) > 50
                 )
 
-                if _is_ctx_fail:
+                if billing_response:
+                    response = _billing_response_messages(billing_response)
+                elif not response and _is_ctx_fail:
                     response = (
                         "⚠️ Session too large for the model's context window.\n"
                         "Use /compact to compress the conversation, or "
                         "/reset to start fresh."
                     )
-                else:
+                elif not response:
                     response = (
                         f"The request failed: {str(error_detail)[:300]}\n"
                         "Try again or use /reset to start a fresh session."
@@ -7701,13 +7895,8 @@ class GatewayRunner:
         platform_name = source.platform.value if source.platform else "unknown"
         chat_id = source.chat_id
         chat_name = source.chat_name or chat_id
-
-        env_key = _home_target_env_var(platform_name)
-
-        # Save to .env so it persists across restarts
         try:
-            from hermes_cli.config import save_env_value
-            save_env_value(env_key, str(chat_id))
+            self._save_home_channel(source.platform, chat_id, chat_name)
         except Exception as e:
             return f"Failed to save home channel: {e}"
 
@@ -7716,6 +7905,30 @@ class GatewayRunner:
             f"Cron jobs and cross-platform messages will be delivered here."
         )
 
+    def _save_home_channel(self, platform: Platform, chat_id: str, chat_name: str) -> None:
+        """Persist a platform home channel and apply it to the live config."""
+        import yaml
+
+        platform_name = platform.value
+        env_key = f"{platform_name.upper()}_HOME_CHANNEL"
+        env_name_key = f"{platform_name.upper()}_HOME_CHANNEL_NAME"
+
+        config_path = _hermes_home / "config.yaml"
+        user_config = {}
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                user_config = yaml.safe_load(f) or {}
+
+        user_config[env_key] = chat_id
+        user_config[env_name_key] = chat_name
+        atomic_yaml_write(config_path, user_config)
+
+        # Also set in the current process so delivery routing picks it up immediately.
+        os.environ[env_key] = str(chat_id)
+        os.environ[env_name_key] = str(chat_name)
+
+        platform_config = self.config.platforms.setdefault(platform, PlatformConfig())
+        platform_config.home_channel = HomeChannel(platform, str(chat_id), str(chat_name))
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
         """Extract Discord guild_id from the raw message object."""
@@ -8092,11 +8305,15 @@ class GatewayRunner:
             # Partition out images so they can be sent as a single batch
             # (e.g. Signal's multi-attachment RPC)
             image_paths: list = []
+            image_urls: list = []
             non_image_media: list = []
             for media_path, is_voice in media_files:
                 ext = Path(media_path).suffix.lower()
                 if ext in _IMAGE_EXTS and not is_voice:
-                    image_paths.append(media_path)
+                    if re.match(r"^https?://", media_path, re.IGNORECASE):
+                        image_urls.append(media_path)
+                    else:
+                        image_paths.append(media_path)
                 else:
                     non_image_media.append((media_path, is_voice))
 
@@ -8117,6 +8334,17 @@ class GatewayRunner:
                     )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+
+            if image_urls:
+                try:
+                    images = [(url, "") for url in image_urls]
+                    await adapter.send_multiple_images(
+                        chat_id=event.source.chat_id,
+                        images=images,
+                        metadata=_thread_meta,
+                    )
+                except Exception as e:
+                    logger.warning("[%s] Post-stream remote image delivery failed: %s", adapter.name, e)
 
             for media_path, is_voice in non_image_media:
                 try:
@@ -8332,7 +8560,19 @@ class GatewayRunner:
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
+            extra_text_messages: list[str] = []
+            if result and (result.get("failed") or (not response and result.get("error"))):
+                failed_payload = _resolve_failed_response_text(
+                    result,
+                    provider=getattr(self, "_provider", "") or "",
+                    model=getattr(self, "_model", "") or "",
+                )
+                if isinstance(failed_payload, list):
+                    response = failed_payload[0] if failed_payload else ""
+                    extra_text_messages = failed_payload[1:]
+                else:
+                    response = failed_payload
+            elif not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
             # Extract media files from the response
@@ -8349,6 +8589,12 @@ class GatewayRunner:
                         content=header + text_content,
                         metadata=_thread_metadata,
                     )
+                    for extra_message in extra_text_messages:
+                        await adapter.send(
+                            chat_id=source.chat_id,
+                            content=extra_message,
+                            metadata=_thread_metadata,
+                        )
                 elif not images and not media_files:
                     await adapter.send(
                         chat_id=source.chat_id,
@@ -8397,6 +8643,191 @@ class GatewayRunner:
             except Exception:
                 pass
 
+    async def _handle_btw_command(self, event: MessageEvent) -> str:
+        """Handle /btw <question> — ephemeral side question in the same chat."""
+        question = event.get_command_args().strip()
+        if not question:
+            return (
+                "Usage: /btw <question>\n"
+                "Example: /btw what module owns session title sanitization?\n\n"
+                "Answers using session context. No tools, not persisted."
+            )
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        # Guard: one /btw at a time per session
+        existing = getattr(self, "_active_btw_tasks", {}).get(session_key)
+        if existing and not existing.done():
+            return "A /btw is already running for this chat. Wait for it to finish."
+
+        if not hasattr(self, "_active_btw_tasks"):
+            self._active_btw_tasks: dict = {}
+
+        import uuid as _uuid
+        task_id = f"btw_{datetime.now().strftime('%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+        _task = asyncio.create_task(self._run_btw_task(question, source, session_key, task_id))
+        self._background_tasks.add(_task)
+        self._active_btw_tasks[session_key] = _task
+
+        def _cleanup(task):
+            self._background_tasks.discard(task)
+            if self._active_btw_tasks.get(session_key) is task:
+                self._active_btw_tasks.pop(session_key, None)
+
+        _task.add_done_callback(_cleanup)
+
+        preview = question[:60] + ("..." if len(question) > 60 else "")
+        return f'💬 /btw: "{preview}"\nReply will appear here shortly.'
+
+    async def _run_btw_task(
+        self, question: str, source, session_key: str, task_id: str,
+    ) -> None:
+        """Execute an ephemeral /btw side question and deliver the answer."""
+        from run_agent import AIAgent
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("No adapter for platform %s in /btw task %s", source.platform, task_id)
+            return
+
+        _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
+
+        try:
+            user_config = _load_gateway_config()
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+                user_config=user_config,
+            )
+            if not runtime_kwargs.get("api_key"):
+                await adapter.send(
+                    source.chat_id,
+                    "❌ /btw failed: no provider credentials configured.",
+                    metadata=_thread_meta,
+                )
+                return
+
+            platform_key = _platform_config_key(source.platform)
+            reasoning_config = self._load_reasoning_config()
+            self._service_tier = self._load_service_tier()
+            turn_route = self._resolve_turn_agent_config(question, model, runtime_kwargs)
+            pr = self._provider_routing
+
+            # Snapshot history from running agent or stored transcript
+            running_agent = self._running_agents.get(session_key)
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                history_snapshot = list(getattr(running_agent, "_session_messages", []) or [])
+            else:
+                session_entry = self.session_store.get_or_create_session(source)
+                history_snapshot = self.session_store.load_transcript(session_entry.session_id)
+
+            btw_prompt = (
+                "[Ephemeral /btw side question. Answer using the conversation "
+                "context. No tools available. Be direct and concise.]\n\n"
+                + question
+            )
+
+            def run_sync():
+                agent = AIAgent(
+                    model=turn_route["model"],
+                    **turn_route["runtime"],
+                    max_iterations=8,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=[],
+                    reasoning_config=reasoning_config,
+                    service_tier=self._service_tier,
+                    request_overrides=turn_route.get("request_overrides"),
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    provider_require_parameters=pr.get("require_parameters", False),
+                    provider_data_collection=pr.get("data_collection"),
+                    session_id=task_id,
+                    platform=platform_key,
+                    session_db=None,
+                    fallback_model=self._fallback_model,
+                    skip_memory=True,
+                    skip_context_files=True,
+                    persist_session=False,
+                )
+                try:
+                    return agent.run_conversation(
+                        user_message=btw_prompt,
+                        conversation_history=history_snapshot,
+                        task_id=task_id,
+                    )
+                finally:
+                    self._cleanup_agent_resources(agent)
+
+            result = await self._run_in_executor_with_context(run_sync)
+
+            response = (result.get("final_response") or "") if result else ""
+            extra_text_messages: list[str] = []
+            if result and (result.get("failed") or (not response and result.get("error"))):
+                failed_payload = _resolve_failed_response_text(
+                    result,
+                    provider=getattr(self, "_provider", "") or "",
+                    model=getattr(self, "_model", "") or "",
+                )
+                if isinstance(failed_payload, list):
+                    response = failed_payload[0] if failed_payload else ""
+                    extra_text_messages = failed_payload[1:]
+                else:
+                    response = failed_payload
+            elif not response and result and result.get("error"):
+                response = f"Error: {result['error']}"
+            if not response:
+                response = "(No response generated)"
+
+            media_files, response = adapter.extract_media(response)
+            images, text_content = adapter.extract_images(response)
+            preview = question[:60] + ("..." if len(question) > 60 else "")
+            header = f'💬 /btw: "{preview}"\n\n'
+
+            if text_content:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + text_content,
+                    metadata=_thread_meta,
+                )
+                for extra_message in extra_text_messages:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=extra_message,
+                        metadata=_thread_meta,
+                    )
+            elif not images and not media_files:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + "(No response generated)",
+                    metadata=_thread_meta,
+                )
+
+            for image_url, alt_text in (images or []):
+                try:
+                    await adapter.send_image(chat_id=source.chat_id, image_url=image_url, caption=alt_text)
+                except Exception:
+                    pass
+
+            for media_path, _is_voice in (media_files or []):
+                try:
+                    await adapter.send_file(chat_id=source.chat_id, file_path=media_path)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.exception("/btw task %s failed", task_id)
+            try:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ /btw failed: {e}",
+                    metadata=_thread_meta,
+                )
+            except Exception:
+                pass
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
 
@@ -9710,6 +10141,7 @@ class GatewayRunner:
     # programmatic interfaces that should not trigger system updates.
     _UPDATE_ALLOWED_PLATFORMS = frozenset({
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
+        Platform.WEIXIN,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
@@ -11977,6 +12409,7 @@ class GatewayRunner:
             if _scfg is None:
                 from gateway.config import StreamingConfig
                 _scfg = StreamingConfig()
+            _adapter = self.adapters.get(source.platform)
 
             # Per-platform streaming gate: display.platforms.<plat>.streaming
             # can disable streaming for specific platforms even when the global
@@ -11998,6 +12431,8 @@ class GatewayRunner:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
+                        if not getattr(_adapter, "supports_gateway_streaming", lambda: True)():
+                            raise RuntimeError("skip streaming for platform that opts out of gateway streaming")
                         # Platforms that don't support editing sent messages
                         # (e.g. QQ, WeChat) should skip streaming entirely —
                         # without edit support, the consumer sends a partial
@@ -12504,13 +12939,33 @@ class GatewayRunner:
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
+            media_tags, has_voice_directive = _collect_new_turn_media_tags(
+                result.get("messages", []),
+                history_media_paths=_history_media_paths,
+            )
+
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                error_msg = ""
+                if not result.get("failed") and result.get("error"):
+                    error_msg = f"⚠️ {result['error']}"
+                final_response = error_msg
+
+            # Scan tool results for MEDIA:<path> tags that need to be delivered
+            # as native attachments even when the model did not restate them in
+            # its final reply. This is the shared artifact-delivery path used by
+            # tools like TTS and image generation.
+            if media_tags and "MEDIA:" not in final_response:
+                if has_voice_directive:
+                    media_tags.insert(0, "[[audio_as_voice]]")
+                final_response = (final_response + "\n" if final_response else "") + "\n".join(media_tags)
+
+            if not final_response:
                 return {
-                    "final_response": error_msg,
+                    "final_response": "",
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "failed": result.get("failed", False),
+                    "error": result.get("error"),
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
@@ -12520,41 +12975,6 @@ class GatewayRunner:
                     "model": _resolved_model,
                     "context_length": _context_length,
                 }
-            
-            # Scan tool results for MEDIA:<path> tags that need to be delivered
-            # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
-            # in its JSON response, but the model's final text reply usually
-            # doesn't include them.  We collect unique tags from tool results and
-            # append any that aren't already present in the final response, so the
-            # adapter's extract_media() can find and deliver the files exactly once.
-            #
-            # Uses path-based deduplication against _history_media_paths (collected
-            # before run_conversation) instead of index slicing. This is safe even
-            # when context compression shrinks the message list. (Fixes #160)
-            if "MEDIA:" not in final_response:
-                media_tags = []
-                has_voice_directive = False
-                for msg in result.get("messages", []):
-                    if msg.get("role") in ("tool", "function"):
-                        content = msg.get("content", "")
-                        if "MEDIA:" in content:
-                            for match in re.finditer(r'MEDIA:(\S+)', content):
-                                path = match.group(1).strip().rstrip('",}')
-                                if path and path not in _history_media_paths:
-                                    media_tags.append(f"MEDIA:{path}")
-                            if "[[audio_as_voice]]" in content:
-                                has_voice_directive = True
-                
-                if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
@@ -12617,6 +13037,8 @@ class GatewayRunner:
                 "last_reasoning": result.get("last_reasoning"),
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
+                "failed": result.get("failed", False),
+                "error": result.get("error"),
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "last_prompt_tokens": _last_prompt_toks,

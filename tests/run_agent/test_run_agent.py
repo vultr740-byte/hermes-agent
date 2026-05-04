@@ -2508,6 +2508,79 @@ class TestRunConversation:
         assert result["final_response"] == "Here is the actual answer."
         assert result["api_calls"] == 2  # 1 original + 1 nudge retry
 
+    def test_empty_response_after_tool_failure_surfaces_tool_error(self, agent):
+        """If the model stays empty after a tool failure, return the tool error."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+
+        tool_calls = [_mock_tool_call("web_search", '{"q": "goldfish"}', call_id="call_tool_fail")]
+        tool_resp = _mock_response(content="", finish_reason="tool_calls", tool_calls=tool_calls)
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp,
+            empty_resp,
+            empty_resp,
+            empty_resp,
+            empty_resp,
+            empty_resp,
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.handle_function_call", return_value=json.dumps({
+                "success": False,
+                "error": "Shared custom-runtime image generation failed. Request timed out.",
+                "error_type": "api_error",
+            })),
+        ):
+            result = agent.run_conversation("帮我生成一张金鱼的照片")
+
+        assert result["completed"] is True
+        assert result["final_response"] == (
+            "The last `web_search` call failed (api_error): "
+            "Shared custom-runtime image generation failed. Request timed out."
+        )
+
+    def test_api_retry_exhaustion_after_tool_failure_keeps_tool_error_visible(self, agent):
+        """If post-tool follow-up API calls fail, surface the tool error first."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+
+        tool_calls = [_mock_tool_call("web_search", '{"q": "goldfish"}', call_id="call_tool_fail")]
+        tool_resp = _mock_response(content="", finish_reason="tool_calls", tool_calls=tool_calls)
+
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp,
+            StopIteration(),
+            StopIteration(),
+            StopIteration(),
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.handle_function_call", return_value=json.dumps({
+                "success": False,
+                "error": "Shared custom-runtime image generation failed. Request timed out.",
+                "error_type": "api_error",
+            })),
+        ):
+            result = agent.run_conversation("帮我生成一张金鱼的照片")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert (
+            "The last `web_search` call failed (api_error): "
+            "Shared custom-runtime image generation failed. Request timed out."
+        ) in result["final_response"]
+        assert (
+            "The model also failed while following up on that tool result after 3 retries:"
+        ) in result["final_response"]
+
     def test_empty_response_triggers_fallback_provider(self, agent):
         """After 3 empty retries, fallback provider is activated and produces content."""
         self._setup_agent(agent)

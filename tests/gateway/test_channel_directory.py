@@ -290,6 +290,18 @@ class TestFormatDirectoryForDisplay:
         assert "telegram:Dev Group" in result
         assert "telegram:Coaching Chat / topic 17585" in result
 
+    def test_weixin_display(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "weixin": [
+                {"id": "user-1", "name": "Alice", "type": "dm"},
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "Weixin:" in result
+        assert "weixin:Alice" in result
+
     def test_discord_grouped_by_guild(self, tmp_path):
         cache_file = _write_directory(tmp_path, {
             "discord": [

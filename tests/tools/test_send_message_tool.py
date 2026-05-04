@@ -623,6 +623,21 @@ class TestSendToPlatformWhatsapp:
         async_mock.assert_awaited_once_with({"bridge_port": 3000}, chat_id, "hello from hermes")
 
 
+class TestSendToPlatformWeixin:
+    def test_weixin_requires_live_gateway_delivery(self):
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.WEIXIN,
+                SimpleNamespace(enabled=True, token=None, extra={"account_id": "bot-1"}),
+                "weixin-user",
+                "hello from hermes",
+            )
+        )
+
+        assert "error" in result
+        assert "not supported for weixin" in result["error"]
+
+
 class TestSendTelegramHtmlDetection:
     """Verify that messages containing HTML tags are sent with parse_mode=HTML
     and that plain / markdown messages use MarkdownV2."""

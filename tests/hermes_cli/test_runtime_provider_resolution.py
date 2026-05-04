@@ -507,6 +507,20 @@ def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
     assert resolved["base_url"] == "https://custom.example/v1"
 
 
+def test_resolve_runtime_provider_auto_uses_openai_base_url_as_custom(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://clawfather.up.railway.app/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "custom-key")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+
+    resolved = rp.resolve_runtime_provider(requested="auto")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["base_url"] == "https://clawfather.up.railway.app/v1"
+    assert resolved["api_key"] == "custom-key"
+
+
 def test_openrouter_key_takes_priority_over_openai_key(monkeypatch):
     """OPENROUTER_API_KEY should be used over OPENAI_API_KEY when both are set.
 
@@ -1413,6 +1427,28 @@ def test_resolve_provider_lmstudio_returns_lmstudio(monkeypatch):
     assert resolve_provider("lmstudio") == "lmstudio"
     assert resolve_provider("lm-studio") == "lmstudio"
     assert resolve_provider("lm_studio") == "lmstudio"
+
+def test_resolve_provider_auto_prefers_custom_when_openai_base_url_set(monkeypatch):
+    """auto mode should treat OPENAI_BASE_URL as a custom OpenAI-compatible endpoint."""
+    from hermes_cli.auth import resolve_provider
+
+    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://clawfather.up.railway.app/v1")
+
+    assert resolve_provider("auto") == "custom"
+
+
+def test_resolve_provider_explicit_base_url_prefers_custom(monkeypatch):
+    """An explicit base_url should route one-off CLI runs to the custom provider."""
+    from hermes_cli.auth import resolve_provider
+
+    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+    assert resolve_provider("auto", explicit_base_url="https://custom.example/v1") == "custom"
 
 
 def test_custom_provider_runtime_preserves_provider_name(monkeypatch):

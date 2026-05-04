@@ -245,6 +245,52 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_origin_without_origin_falls_back_to_weixin_home_channel(self, monkeypatch):
+        from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+
+        for fallback_env in (
+            "MATRIX_HOME_ROOM",
+            "MATRIX_HOME_CHANNEL",
+            "TELEGRAM_HOME_CHANNEL",
+            "DISCORD_HOME_CHANNEL",
+            "SLACK_HOME_CHANNEL",
+            "SIGNAL_HOME_CHANNEL",
+            "MATTERMOST_HOME_CHANNEL",
+            "SMS_HOME_CHANNEL",
+            "EMAIL_HOME_ADDRESS",
+            "DINGTALK_HOME_CHANNEL",
+            "BLUEBUBBLES_HOME_CHANNEL",
+            "FEISHU_HOME_CHANNEL",
+            "WECOM_HOME_CHANNEL",
+            "WEIXIN_HOME_CHANNEL",
+            "QQBOT_HOME_CHANNEL",
+            "QQ_HOME_CHANNEL",
+        ):
+            monkeypatch.delenv(fallback_env, raising=False)
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "c1")
+
+        config = GatewayConfig(
+            platforms={
+                Platform.WEIXIN: PlatformConfig(
+                    enabled=True,
+                    token="tok-123",
+                    home_channel=HomeChannel(
+                        platform=Platform.WEIXIN,
+                        chat_id="wxid_home_1",
+                        name="Home",
+                    ),
+                    extra={"account_id": "084392601658@im.bot"},
+                )
+            }
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config):
+            assert _resolve_delivery_target({"deliver": "origin"}) == {
+                "platform": "weixin",
+                "chat_id": "wxid_home_1",
+                "thread_id": None,
+            }
+
     def test_explicit_discord_topic_target_with_thread_id(self):
         """deliver: 'discord:chat_id:thread_id' parses correctly."""
         job = {
