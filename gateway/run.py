@@ -309,6 +309,17 @@ def _billing_response_messages(response: BillingFailureResponse | None) -> list[
     return response.as_messages()
 
 
+def _stringify_gateway_response(response: Any) -> str:
+    """Return text for gateway flows that require a single string."""
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return response
+    if isinstance(response, list):
+        return "\n".join(str(part) for part in response if part)
+    return str(response)
+
+
 def _resolve_failed_response_text(
     result: Dict[str, Any] | None,
     *,
@@ -6421,8 +6432,14 @@ class GatewayRunner:
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
-                await self._send_voice_reply(event, response)
+            _response_text_for_tts = _stringify_gateway_response(response)
+            if self._should_send_voice_reply(
+                event,
+                _response_text_for_tts,
+                agent_messages,
+                already_sent=_already_sent,
+            ):
+                await self._send_voice_reply(event, _response_text_for_tts)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
