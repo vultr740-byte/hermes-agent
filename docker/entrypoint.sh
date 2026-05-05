@@ -190,6 +190,46 @@ print(f"[entrypoint] Configured custom model endpoint: {base_url} (model={chosen
 PY
 }
 
+configure_default_image_generation() {
+    export HERMES_HOME
+    python3 - <<'PY'
+import os
+from pathlib import Path
+
+import yaml
+
+
+def load_config(path: Path):
+    if not path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+config = load_config(config_path)
+image_cfg = config.get("image_gen")
+if not isinstance(image_cfg, dict):
+    image_cfg = {}
+
+changed = False
+if not str(image_cfg.get("provider") or "").strip():
+    image_cfg["provider"] = "openai"
+    changed = True
+if not str(image_cfg.get("model") or "").strip():
+    image_cfg["model"] = "gpt-image-2-medium"
+    changed = True
+
+if changed:
+    config["image_gen"] = image_cfg
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    print("[entrypoint] Configured default image generation: openai / gpt-image-2-medium")
+PY
+}
+
 # Create essential directory structure.  Cache and platform directories
 # (cache/images, cache/audio, platforms/whatsapp, etc.) are created on
 # demand by the application — don't pre-create them here so new installs
@@ -208,6 +248,7 @@ fi
 if [ ! -f "$HERMES_HOME/config.yaml" ]; then
     cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
 fi
+configure_default_image_generation
 
 # SOUL.md
 if [ ! -f "$HERMES_HOME/SOUL.md" ]; then

@@ -580,6 +580,14 @@ agent:
 # Use `hermes tools` to interactively enable/disable tools per platform.
 
 # =============================================================================
+# Image Generation
+# =============================================================================
+# Default image generation backend. Requires OPENAI_API_KEY in .env.
+image_gen:
+  provider: openai
+  model: gpt-image-2-medium
+
+# =============================================================================
 # Platform Toolsets (per-platform tool configuration)
 # =============================================================================
 # Override which toolsets are available on each platform.
