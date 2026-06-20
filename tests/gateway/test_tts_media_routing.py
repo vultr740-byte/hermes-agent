@@ -261,3 +261,35 @@ async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_pa
 
     adapter.send_document.assert_not_awaited()
     adapter.send_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_delivery_routes_remote_image_media_tag_to_image_sender():
+    event = _event(thread_id="topic-1")
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image-file")),
+        send_image=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_multiple_images=AsyncMock(return_value=None),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        "MEDIA:https://example.com/fish.png",
+        event,
+        adapter,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once_with(
+        chat_id="chat-1",
+        images=[("https://example.com/fish.png", "")],
+        metadata={"thread_id": "topic-1"},
+    )
+    adapter.send_image_file.assert_not_awaited()
+    adapter.send_document.assert_not_awaited()

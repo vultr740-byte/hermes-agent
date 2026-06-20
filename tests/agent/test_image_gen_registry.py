@@ -74,12 +74,12 @@ class TestGetActiveProvider:
         active = image_gen_registry.get_active_provider()
         assert active is not None and active.name == "solo"
 
-    def test_fal_preferred_on_multi_without_config(self, tmp_path, monkeypatch):
+    def test_custom_preferred_on_multi_without_config(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         image_gen_registry.register_provider(_FakeProvider("fal"))
-        image_gen_registry.register_provider(_FakeProvider("openai"))
+        image_gen_registry.register_provider(_FakeProvider("custom"))
         active = image_gen_registry.get_active_provider()
-        assert active is not None and active.name == "fal"
+        assert active is not None and active.name == "custom"
 
     def test_explicit_config_wins(self, tmp_path, monkeypatch):
         import yaml
@@ -89,6 +89,7 @@ class TestGetActiveProvider:
             yaml.safe_dump({"image_gen": {"provider": "openai"}})
         )
         image_gen_registry.register_provider(_FakeProvider("fal"))
+        image_gen_registry.register_provider(_FakeProvider("custom"))
         image_gen_registry.register_provider(_FakeProvider("openai"))
         active = image_gen_registry.get_active_provider()
         assert active is not None and active.name == "openai"
@@ -103,7 +104,7 @@ class TestGetActiveProvider:
         # Only FAL is registered — configured provider doesn't exist
         image_gen_registry.register_provider(_FakeProvider("fal"))
         active = image_gen_registry.get_active_provider()
-        # Falls back to FAL preference (legacy default) rather than None
+        # Falls back to the remaining available provider rather than None.
         assert active is not None and active.name == "fal"
 
     def test_none_when_empty(self, tmp_path, monkeypatch):

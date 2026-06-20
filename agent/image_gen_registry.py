@@ -11,10 +11,12 @@ Active selection
 The active provider is chosen by ``image_gen.provider`` in ``config.yaml``.
 If unset, :func:`get_active_provider` applies fallback logic:
 
-1. If exactly one provider is registered, use it.
-2. Otherwise if a provider named ``fal`` is registered, use it (legacy
-   default — matches pre-plugin behavior).
-3. Otherwise return ``None`` (the tool surfaces a helpful error pointing
+1. If exactly one provider is registered and available, use it.
+2. Otherwise if a provider named ``custom`` is registered and available,
+   use it as the gateway branch default.
+3. Otherwise if a provider named ``fal`` is registered and available,
+   use it for legacy fallback compatibility.
+4. Otherwise return ``None`` (the tool surfaces a helpful error pointing
    the user at ``hermes tools``).
 """
 
@@ -85,7 +87,7 @@ def get_active_provider() -> Optional[ImageGenProvider]:
       reports False — the dispatcher surfaces a precise "X_API_KEY is not
       set" error rather than silently switching backends.
     - When ``image_gen.provider`` is unset, the fallback path (single-
-      provider shortcut and the FAL legacy preference) is filtered by
+      provider shortcut, custom default, and FAL legacy preference) is filtered by
       ``is_available()`` so we don't pick a provider the user has no
       credentials for.
     """
@@ -131,7 +133,12 @@ def get_active_provider() -> Optional[ImageGenProvider]:
     if len(available) == 1:
         return available[0]
 
-    # 3. Fallback: prefer legacy FAL for backward compat, when available.
+    # 3. Fallback: prefer the gateway branch default custom provider, when available.
+    custom = snapshot.get("custom")
+    if custom is not None and _is_available_safe(custom):
+        return custom
+
+    # 4. Fallback: prefer legacy FAL for backward compat, when available.
     fal = snapshot.get("fal")
     if fal is not None and _is_available_safe(fal):
         return fal

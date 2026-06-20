@@ -1233,6 +1233,125 @@ def _resolve_azure_foundry_runtime(
     }
 
 
+def _resolve_custom_runtime(
+    *,
+    requested_provider: str,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    model_cfg = _get_model_config()
+    cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
+    cfg_provider = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else ""
+    cfg_api_key = ""
+    for k in ("api_key", "api"):
+        v = model_cfg.get(k)
+        if isinstance(v, str) and v.strip():
+            cfg_api_key = v.strip()
+            break
+
+    requested_norm = (requested_provider or "").strip().lower()
+    original_requested_norm = requested_norm
+    if requested_norm and requested_norm != "custom":
+        try:
+            from hermes_cli.auth import resolve_provider as _resolve_provider
+
+            if _resolve_provider(requested_norm) == "custom":
+                requested_norm = "custom"
+        except Exception:
+            pass
+    cfg_provider = cfg_provider.strip().lower()
+    env_openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+    env_custom_base_url = os.getenv("CUSTOM_BASE_URL", "").strip()
+
+    use_config_base_url = False
+    if cfg_base_url.strip() and not explicit_base_url:
+        if requested_norm == "auto":
+            if not cfg_provider or cfg_provider == "auto" or _config_base_url_trustworthy_for_bare_custom(
+                cfg_base_url, cfg_provider
+            ):
+                use_config_base_url = True
+        elif requested_norm == "custom" and _config_base_url_trustworthy_for_bare_custom(
+            cfg_base_url, cfg_provider
+        ):
+            use_config_base_url = True
+
+    base_url_source = ""
+    if explicit_base_url:
+        base_url_source = "explicit"
+    elif env_custom_base_url:
+        base_url_source = "custom_env"
+    elif use_config_base_url and cfg_base_url.strip():
+        base_url_source = "config"
+    elif env_openai_base_url:
+        base_url_source = "openai_env"
+
+    base_url = (
+        (explicit_base_url or "").strip()
+        or env_custom_base_url
+        or (cfg_base_url.strip() if use_config_base_url else "")
+        or env_openai_base_url
+    ).rstrip("/")
+
+    if base_url:
+        pool_result = _try_resolve_from_custom_pool(
+            base_url,
+            "custom",
+            _parse_api_mode(model_cfg.get("api_mode")),
+            provider_name=(
+                original_requested_norm
+                if original_requested_norm and original_requested_norm != "custom"
+                else None
+            ),
+        )
+        if pool_result:
+            return pool_result
+
+    _is_ollama_url = base_url_host_matches(base_url, "ollama.com")
+    _is_openai_url = base_url_host_matches(base_url, "openai.com")
+    _is_openai_azure = base_url_host_matches(base_url, "openai.azure.com")
+    _is_openrouter_url = base_url_host_matches(base_url, "openrouter.ai")
+    # Docker/Railway startup writes OPENAI_BASE_URL into config.yaml so the
+    # endpoint survives restarts. After that write, the selected base_url looks
+    # config-sourced even though OPENAI_API_KEY is still the paired env secret.
+    # Preserve that explicit env pairing without reopening the broad
+    # "send OPENAI_API_KEY to any custom config endpoint" leak fixed in #28660.
+    env_openai_base_url_matches = bool(
+        env_openai_base_url
+        and base_url.rstrip("/") == env_openai_base_url.rstrip("/")
+    )
+    api_key_candidates = [
+        (explicit_api_key or "").strip(),
+        (cfg_api_key if use_config_base_url else ""),
+        (os.getenv("OLLAMA_API_KEY") if _is_ollama_url else ""),
+        (
+            os.getenv("OPENAI_API_KEY")
+            if (
+                _is_openai_url
+                or _is_openai_azure
+                or base_url_source == "openai_env"
+                or env_openai_base_url_matches
+            )
+            else ""
+        ),
+        (os.getenv("OPENROUTER_API_KEY") if _is_openrouter_url else ""),
+        _host_derived_api_key(base_url),
+    ]
+    api_key = next(
+        (str(candidate or "").strip() for candidate in api_key_candidates if has_usable_secret(candidate)),
+        "",
+    )
+
+    return {
+        "provider": "custom",
+        "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
+        or _detect_api_mode_for_url(base_url)
+        or "chat_completions",
+        "base_url": base_url,
+        "api_key": api_key or "no-key-required",
+        "source": "explicit" if (explicit_api_key or explicit_base_url) else "env/config",
+    }
+
+
 def _resolve_explicit_runtime(
     *,
     provider: str,
@@ -1646,6 +1765,15 @@ def resolve_runtime_provider(
             "source": creds.get("source", "process"),
             "requested_provider": requested_provider,
         }
+
+    if provider == "custom":
+        runtime = _resolve_custom_runtime(
+            requested_provider=requested_provider,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
+        runtime["requested_provider"] = requested_provider
+        return runtime
 
     # Anthropic (native Messages API)
     if provider == "anthropic":

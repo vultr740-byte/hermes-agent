@@ -654,6 +654,14 @@ agent:
 # Use `hermes tools` to interactively enable/disable tools per platform.
 
 # =============================================================================
+# Image Generation
+# =============================================================================
+# Default image generation backend. Reuses the main custom runtime.
+image_gen:
+  provider: custom
+  model: gpt-image-2-medium
+
+# =============================================================================
 # Platform Toolsets (per-platform tool configuration)
 # =============================================================================
 # Override which toolsets are available on each platform.

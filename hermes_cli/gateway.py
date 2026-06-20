@@ -4394,6 +4394,12 @@ _PLATFORMS = [
         "token_var": "WHATSAPP_ENABLED",
     },
     {
+        "key": "weixin",
+        "label": "Weixin",
+        "emoji": "💬",
+        "token_var": "WEIXIN_ALLOW_ALL_USERS",
+    },
+    {
         "key": "signal",
         "label": "Signal",
         "emoji": "📡",
@@ -4889,6 +4895,14 @@ def _platform_status(platform: dict) -> str:
             if session_file.exists():
                 return "configured + paired"
             return "enabled, not paired"
+        return "not configured"
+    if platform.get("key") == "weixin":
+        accounts_dir = get_hermes_home() / "weixin" / "accounts"
+        if accounts_dir.exists() and any(
+            path.is_file() and path.suffix == ".json" and not path.name.endswith(".context-tokens.json")
+            for path in accounts_dir.glob("*.json")
+        ):
+            return "paired"
         return "not configured"
     if platform.get("key") == "signal":
         account = get_env_value("SIGNAL_ACCOUNT")

@@ -244,7 +244,7 @@ DM pairing is ideal for teams because you don't need to restart the gateway when
 
 ### Security Considerations
 
-- **Never set `GATEWAY_ALLOW_ALL_USERS=true`** on a bot with terminal access — anyone who finds your bot could run commands on your server
+- **Set `GATEWAY_ALLOW_ALL_USERS=false`** on a bot with terminal access — otherwise Hermes defaults to open access and anyone who finds your bot could run commands on your server
 - Pairing codes expire after **1 hour** and use cryptographic randomness
 - Rate limiting prevents brute-force attacks: 1 request per user per 10 minutes, max 3 pending codes per platform
 - After 5 failed approval attempts, the platform enters a 1-hour lockout

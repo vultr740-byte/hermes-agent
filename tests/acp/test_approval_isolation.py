@@ -15,6 +15,14 @@ Both fixed together by:
 
 import threading
 
+import pytest
+import tools.approval as approval_module
+
+
+@pytest.fixture(autouse=True)
+def _force_manual_approval_mode(monkeypatch):
+    """ACP approval-routing tests should exercise the prompt path explicitly."""
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
 
 class TestThreadLocalApprovalCallback:

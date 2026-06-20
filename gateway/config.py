@@ -22,6 +22,47 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def _has_weixin_account_state() -> bool:
+    """Return True when a persisted Weixin login session exists."""
+    state = _load_weixin_account_state_fallback()
+    return bool(state and state.get("bot_token"))
+
+
+def _load_weixin_account_state_fallback() -> Dict[str, Any]:
+    """Load persisted Weixin credentials without requiring env vars."""
+    try:
+        from gateway.platforms.weixin import load_weixin_account_state
+
+        state = load_weixin_account_state()
+        if not isinstance(state, dict):
+            return {}
+        token = str(state.get("bot_token") or "").strip()
+        account_id = str(state.get("account_id") or "").strip()
+        if not token or not account_id:
+            return {}
+        return state
+    except Exception:
+        return {}
+
+
+def _enabled_channel() -> Optional[str]:
+    """Return the configured single enabled messaging channel, if any."""
+    value = str(os.getenv("HERMES_ENABLED_CHANNEL") or "").strip().lower().replace("-", "_")
+    return value or None
+
+
+def _channel_is_enabled(name: str) -> bool:
+    """Return True when the single-channel selector enables this platform."""
+    selected = _enabled_channel()
+    return selected == name
+
+
+def _single_channel_filter_allows(name: str) -> bool:
+    """Return True when no single-channel filter is set or it matches ``name``."""
+    selected = _enabled_channel()
+    return selected is None or selected == name
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
@@ -235,7 +276,6 @@ class Platform(Enum):
 # Snapshot of built-in platform values before any dynamic _missing_ lookups.
 # Used to distinguish real platforms from arbitrary strings.
 _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.values())
-
 
 @dataclass
 class HomeChannel:
@@ -1387,12 +1427,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     def _enable_from_env(platform: Platform) -> PlatformConfig:
         if platform not in config.platforms:
-            config.platforms[platform] = PlatformConfig(enabled=True)
+            config.platforms[platform] = PlatformConfig(
+                enabled=_single_channel_filter_allows(platform.value)
+            )
             return config.platforms[platform]
 
         platform_config = config.platforms[platform]
         enabled_was_explicit = bool(platform_config.extra.pop("_enabled_explicit", False))
-        if not platform_config.enabled and not enabled_was_explicit:
+        if (
+            _single_channel_filter_allows(platform.value)
+            and not platform_config.enabled
+            and not enabled_was_explicit
+        ):
             platform_config.enabled = True
         return platform_config
     
@@ -1456,10 +1502,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         wa_cfg = config.platforms[Platform.WHATSAPP]
         if whatsapp_disabled_explicitly:
             wa_cfg.enabled = False
-        elif whatsapp_enabled:
+        elif whatsapp_enabled and _single_channel_filter_allows(Platform.WHATSAPP.value):
             wa_cfg.enabled = True
         # else: keep whatever the YAML set
-    elif whatsapp_enabled:
+    elif whatsapp_enabled and _single_channel_filter_allows(Platform.WHATSAPP.value):
         config.platforms[Platform.WHATSAPP] = PlatformConfig(enabled=True)
     whatsapp_home = os.getenv("WHATSAPP_HOME_CHANNEL")
     if whatsapp_home and Platform.WHATSAPP in config.platforms:
@@ -1477,45 +1523,43 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     whatsapp_cloud_phone_id = os.getenv("WHATSAPP_CLOUD_PHONE_NUMBER_ID")
     whatsapp_cloud_token = os.getenv("WHATSAPP_CLOUD_ACCESS_TOKEN")
     if whatsapp_cloud_phone_id and whatsapp_cloud_token:
-        if Platform.WHATSAPP_CLOUD not in config.platforms:
-            config.platforms[Platform.WHATSAPP_CLOUD] = PlatformConfig()
-        config.platforms[Platform.WHATSAPP_CLOUD].enabled = True
-        config.platforms[Platform.WHATSAPP_CLOUD].extra.update({
+        whatsapp_cloud_config = _enable_from_env(Platform.WHATSAPP_CLOUD)
+        whatsapp_cloud_config.extra.update({
             "phone_number_id": whatsapp_cloud_phone_id,
             "access_token": whatsapp_cloud_token,
         })
         # Optional: app_id / app_secret (signature verification)
         wa_cloud_app_id = os.getenv("WHATSAPP_CLOUD_APP_ID")
         if wa_cloud_app_id:
-            config.platforms[Platform.WHATSAPP_CLOUD].extra["app_id"] = wa_cloud_app_id
+            whatsapp_cloud_config.extra["app_id"] = wa_cloud_app_id
         wa_cloud_app_secret = os.getenv("WHATSAPP_CLOUD_APP_SECRET")
         if wa_cloud_app_secret:
-            config.platforms[Platform.WHATSAPP_CLOUD].extra["app_secret"] = wa_cloud_app_secret
+            whatsapp_cloud_config.extra["app_secret"] = wa_cloud_app_secret
         # Optional: WABA id (analytics, future use)
         wa_cloud_waba_id = os.getenv("WHATSAPP_CLOUD_WABA_ID")
         if wa_cloud_waba_id:
-            config.platforms[Platform.WHATSAPP_CLOUD].extra["waba_id"] = wa_cloud_waba_id
+            whatsapp_cloud_config.extra["waba_id"] = wa_cloud_waba_id
         # Webhook verify token — Meta hub.verify_token shared secret
         wa_cloud_verify_token = os.getenv("WHATSAPP_CLOUD_VERIFY_TOKEN")
         if wa_cloud_verify_token:
-            config.platforms[Platform.WHATSAPP_CLOUD].extra["verify_token"] = wa_cloud_verify_token
+            whatsapp_cloud_config.extra["verify_token"] = wa_cloud_verify_token
         # Webhook server bind config (defaults baked into the adapter)
         wa_cloud_host = os.getenv("WHATSAPP_CLOUD_WEBHOOK_HOST")
         if wa_cloud_host:
-            config.platforms[Platform.WHATSAPP_CLOUD].extra["webhook_host"] = wa_cloud_host
+            whatsapp_cloud_config.extra["webhook_host"] = wa_cloud_host
         wa_cloud_port = os.getenv("WHATSAPP_CLOUD_WEBHOOK_PORT")
         if wa_cloud_port:
             try:
-                config.platforms[Platform.WHATSAPP_CLOUD].extra["webhook_port"] = int(wa_cloud_port)
+                whatsapp_cloud_config.extra["webhook_port"] = int(wa_cloud_port)
             except ValueError:
                 pass
         wa_cloud_path = os.getenv("WHATSAPP_CLOUD_WEBHOOK_PATH")
         if wa_cloud_path:
-            config.platforms[Platform.WHATSAPP_CLOUD].extra["webhook_path"] = wa_cloud_path
+            whatsapp_cloud_config.extra["webhook_path"] = wa_cloud_path
         # Graph API version override (rarely needed)
         wa_cloud_api_version = os.getenv("WHATSAPP_CLOUD_API_VERSION")
         if wa_cloud_api_version:
-            config.platforms[Platform.WHATSAPP_CLOUD].extra["api_version"] = wa_cloud_api_version
+            whatsapp_cloud_config.extra["api_version"] = wa_cloud_api_version
     whatsapp_cloud_home = os.getenv("WHATSAPP_CLOUD_HOME_CHANNEL")
     if whatsapp_cloud_home and Platform.WHATSAPP_CLOUD in config.platforms:
         config.platforms[Platform.WHATSAPP_CLOUD].home_channel = HomeChannel(
@@ -1524,6 +1568,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             name=os.getenv("WHATSAPP_CLOUD_HOME_CHANNEL_NAME", "Home"),
             thread_id=os.getenv("WHATSAPP_CLOUD_HOME_CHANNEL_THREAD_ID") or None,
         )
+
+    # Weixin personal account (QR login + iLink long-poll)
+    # Register the platform whenever it is the selected channel so fresh
+    # deployments can complete QR login first, then reconnect in-process.
+    if _channel_is_enabled(Platform.WEIXIN.value):
+        if Platform.WEIXIN not in config.platforms:
+            config.platforms[Platform.WEIXIN] = PlatformConfig()
+        config.platforms[Platform.WEIXIN].enabled = True
+        if os.getenv("WEIXIN_POLL_TIMEOUT_MS"):
+            config.platforms[Platform.WEIXIN].extra["poll_timeout_ms"] = os.getenv("WEIXIN_POLL_TIMEOUT_MS")
 
     # Slack
     slack_token = os.getenv("SLACK_BOT_TOKEN")
@@ -1864,9 +1918,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         })
 
     # Weixin (personal WeChat via iLink Bot API)
+    weixin_state = _load_weixin_account_state_fallback()
     weixin_token = os.getenv("WEIXIN_TOKEN")
     weixin_account_id = os.getenv("WEIXIN_ACCOUNT_ID")
-    if weixin_token or weixin_account_id:
+    if not weixin_token:
+        weixin_token = str(weixin_state.get("bot_token") or "").strip() or None
+    if not weixin_account_id:
+        weixin_account_id = str(weixin_state.get("account_id") or "").strip() or None
+    if (weixin_token or weixin_account_id) and _single_channel_filter_allows(Platform.WEIXIN.value):
         if Platform.WEIXIN not in config.platforms:
             config.platforms[Platform.WEIXIN] = PlatformConfig()
         config.platforms[Platform.WEIXIN].enabled = True
@@ -1876,6 +1935,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if weixin_account_id:
             extra["account_id"] = weixin_account_id
         weixin_base_url = os.getenv("WEIXIN_BASE_URL", "").strip()
+        if not weixin_base_url:
+            weixin_base_url = str(weixin_state.get("base_url") or "").strip()
         if weixin_base_url:
             extra["base_url"] = weixin_base_url.rstrip("/")
         weixin_cdn_base_url = os.getenv("WEIXIN_CDN_BASE_URL", "").strip()

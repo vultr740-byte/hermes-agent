@@ -2048,6 +2048,11 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 role,
             )
             continue
+        if "timestamp" in msg:
+            # Gateway/platform timestamps are Hermes persistence metadata.
+            # Strict OpenAI-compatible gateways may reject unknown message keys.
+            msg = dict(msg)
+            msg.pop("timestamp", None)
         filtered.append(msg)
     messages = filtered
 

@@ -1,0 +1,6 @@
+name: custom
+version: 1.0.0
+description: "Image generation via the same custom-provider runtime config as Hermes chat/TUI. Reuses the configured custom base_url/auth and saves generated images to $HERMES_HOME/cache/images/."
+author: NousResearch
+kind: backend
+requires_env: []

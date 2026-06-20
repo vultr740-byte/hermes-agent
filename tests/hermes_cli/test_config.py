@@ -987,6 +987,13 @@ class TestDiscordChannelPromptsConfig:
         assert raw["discord"]["channel_prompts"] == {}
 
 
+class TestImageGenDefaultConfig:
+    def test_default_config_uses_main_runtime_gpt_image_2(self):
+        assert DEFAULT_CONFIG["image_gen"]["provider"] == "custom"
+        assert DEFAULT_CONFIG["image_gen"]["model"] == "gpt-image-2-medium"
+        assert DEFAULT_CONFIG["image_gen"]["use_gateway"] is False
+
+
 class TestUserMessagePreviewConfig:
     def test_default_config_preview_line_counts(self):
         preview = DEFAULT_CONFIG["display"]["user_message_preview"]

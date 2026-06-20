@@ -28,6 +28,23 @@ from gateway.whatsapp_identity import (
 )
 
 
+def _load_weixin_authorized_user_ids() -> set[str]:
+    """Return Weixin user IDs implicitly authorized by the saved login state."""
+    try:
+        from gateway.platforms.weixin import load_weixin_account_state
+
+        payload = load_weixin_account_state() or {}
+    except Exception:
+        return set()
+
+    ids = set()
+    for key in ("user_id", "ilink_user_id", "account_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            ids.add(value)
+    return ids
+
+
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
@@ -37,9 +54,9 @@ class GatewayAuthorizationMixin:
         Mirrors ``BasePlatformAdapter.enforces_own_access_policy``. Adapters
         such as WeCom, Weixin, Yuanbao, QQBot, and WhatsApp evaluate their
         documented ``dm_policy`` / ``group_policy`` / ``allow_from`` config before a
-        message is dispatched to the gateway. The flag alone is NOT "already
-        authorized": these adapters default to ``open``, which forwards every
-        sender, so ``_is_user_authorized`` only trusts the adapter when its
+        message is dispatched to the gateway. In locked-down mode
+        (``GATEWAY_ALLOW_ALL_USERS=false``), the flag alone is NOT "already
+        authorized"; ``_is_user_authorized`` only trusts the adapter when its
         effective policy for the chat type is an actual ``allowlist`` restriction
         (see that method). Defaults to ``False`` when the adapter is unknown or
         doesn't expose the flag.
@@ -181,8 +198,8 @@ class GatewayAuthorizationMixin:
         1. Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         2. Environment variable allowlists (TELEGRAM_ALLOWED_USERS, etc.)
         3. DM pairing approved list
-        4. Global allow-all (GATEWAY_ALLOW_ALL_USERS=true)
-        5. Default: deny
+        4. Global allow-all / default-open gate (GATEWAY_ALLOW_ALL_USERS)
+        5. Default: allow unless GATEWAY_ALLOW_ALL_USERS=false
         """
         from gateway.run import logger
         # Home Assistant events are system-generated (state changes), not
@@ -313,6 +330,13 @@ class GatewayAuthorizationMixin:
         if self.pairing_store.is_approved(platform_name, user_id):
             return True
 
+        if source.platform == Platform.WEIXIN:
+            weixin_ids = _load_weixin_authorized_user_ids()
+            if user_id in weixin_ids:
+                return True
+            if source.chat_id and str(source.chat_id) in weixin_ids:
+                return True
+
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
         group_user_allowlist = ""
@@ -323,29 +347,14 @@ class GatewayAuthorizationMixin:
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
-            # No env allowlist configured. Adapters that own their own
-            # config-driven access policy (dm_policy / group_policy /
-            # allow_from / group_allow_from) gate access at intake, so for those
-            # platforms we can honor the adapter's decision instead of the
-            # env-only default-deny below -- but ONLY when that decision was an
-            # actual allowlist restriction.
-            #
-            # The adapters default dm_policy / group_policy to "open", which
-            # forwards EVERY sender. Reading "reached the gateway" as
-            # authorization in that case would admit the whole external network
-            # with no operator-configured allowlist -- the fail-open SECURITY.md
-            # §2.6 forbids ("an allowlist is required for every enabled
-            # network-exposed adapter ... code paths that fail open when no
-            # allowlist is configured are code bugs"). "disabled" never
-            # forwards, and "pairing" forwards unpaired DMs only so the gateway
-            # can run its pairing handshake (the pairing-store check above
-            # already denied this sender). So trust the adapter only when its
-            # effective policy for THIS chat type is "allowlist"; for "open" /
-            # "pairing" / anything else, fall through to default-deny, where
-            # GATEWAY_ALLOW_ALL_USERS, the per-platform {PLATFORM}_ALLOW_ALL_USERS
-            # flag (checked above), and the pairing flow remain the explicit
-            # opt-ins to broader access. (#34515 follow-up: trusting "open" was a
-            # fail-open.)
+            # No env allowlist configured. Gateway branch policy is open by
+            # default, but when the operator explicitly sets
+            # GATEWAY_ALLOW_ALL_USERS=false we still need to avoid double-denying
+            # config-only adapter allowlists. Own-policy adapters gate access at
+            # intake, so reaching the gateway under an effective "allowlist"
+            # policy means the sender already passed that adapter restriction.
+            # Plain "open" / "pairing" are not treated as adapter authorization;
+            # they fall through to the default-open/default-closed gate below.
             if self._adapter_enforces_own_access_policy(source.platform):
                 if source.chat_type in {"group", "forum", "channel"}:
                     effective_policy = self._adapter_group_policy(source.platform)
@@ -358,8 +367,15 @@ class GatewayAuthorizationMixin:
                     effective_policy = self._adapter_dm_policy(source.platform)
                 if effective_policy == "allowlist":
                     return True
-            # No allowlists configured -- check global allow-all flag
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+            # Gateway branch policy: no allowlists means open access unless
+            # the operator explicitly opts back into the locked-down pairing
+            # path with GATEWAY_ALLOW_ALL_USERS=false.
+            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() not in {
+                "false",
+                "0",
+                "no",
+                "off",
+            }
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates

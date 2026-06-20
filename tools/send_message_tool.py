@@ -711,12 +711,32 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     media_files = media_files or []
 
-    # Weixin handles text/media delivery inside its native helper and does not
-    # need the optional platform adapter imports below. Keep this branch early
-    # so a Weixin send is not blocked by unrelated optional dependencies (for
-    # example lark-oapi's heavy Feishu import path).
+    # Weixin delivery depends on the logged-in gateway adapter. Do not attempt
+    # a standalone token send from cron/CLI processes; personal Weixin state is
+    # session-bound and may not be available or authorized there.
     if platform == Platform.WEIXIN:
-        return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
+        if media_files:
+            return await _send_weixin(
+                pconfig,
+                chat_id,
+                message,
+                media_files=media_files,
+            )
+        result = await _send_via_adapter(
+            platform,
+            pconfig,
+            chat_id,
+            message,
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document,
+        )
+        if isinstance(result, dict) and result.get("error"):
+            return _error(
+                "Direct send_message delivery is not supported for weixin. "
+                "Use the running gateway adapter instead."
+            )
+        return result
 
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
     from gateway.platforms.slack import SlackAdapter
@@ -904,6 +924,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_slack(pconfig.token, chat_id, chunk, thread_ts=thread_id)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.WEIXIN:
+            result = _error(
+                "Direct send_message delivery is not supported for weixin. "
+                "Use the running gateway adapter or a configured home channel delivery instead."
+            )
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:

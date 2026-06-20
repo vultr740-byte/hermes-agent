@@ -3309,8 +3309,15 @@ def run_conversation(
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
                         )
+                    _tool_failure_summary = agent._latest_failed_tool_result_summary(messages)
+                    _final_response = str(api_error)
+                    if _tool_failure_summary:
+                        _final_response = (
+                            f"{_tool_failure_summary}\n\n"
+                            f"The model also failed while following up on that tool result: {api_error}"
+                        )
                     return {
-                        "final_response": None,
+                        "final_response": _final_response,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
@@ -3401,10 +3408,17 @@ def run_conversation(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
                     agent._persist_session(messages, conversation_history)
+                    _tool_failure_summary = agent._latest_failed_tool_result_summary(messages)
                     if classified.reason == FailoverReason.billing:
                         _final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
                             _final_response += f"\n\n{_billing_guidance}"
+                    elif _tool_failure_summary:
+                        _final_response = (
+                            f"{_tool_failure_summary}\n\n"
+                            f"The model also failed while following up on that tool result "
+                            f"after {max_retries} retries: {_final_summary}"
+                        )
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_stream_drop:
@@ -4299,6 +4313,7 @@ def run_conversation(
                     agent._flush_status_buffer()
                     _turn_exit_reason = "empty_response_exhausted"
                     reasoning_text = agent._extract_reasoning(assistant_message)
+                    _tool_failure_summary = agent._latest_failed_tool_result_summary(messages)
                     agent._drop_trailing_empty_response_scaffolding(messages)
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                     assistant_msg["content"] = "(empty)"
@@ -4335,7 +4350,18 @@ def run_conversation(
                                ". No fallback providers configured.")
                         )
 
-                    final_response = "(empty)"
+                    if _tool_failure_summary:
+                        logger.warning(
+                            "Model stayed empty after tool failure — surfacing "
+                            "last tool error directly"
+                        )
+                        agent._emit_status(
+                            "⚠️ Model returned empty after tool failure — "
+                            "using the tool error as the final answer"
+                        )
+                        final_response = _tool_failure_summary
+                    else:
+                        final_response = "(empty)"
                     break
                 
                 # Reset retry counter/signature on successful content

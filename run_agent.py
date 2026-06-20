@@ -5143,6 +5143,72 @@ class AIAgent:
             "to change strategy instead of repeating the same call."
         )
 
+    def _latest_failed_tool_result_summary(self, messages: list) -> Optional[str]:
+        """Return a concise summary of the most recent failed tool result."""
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+
+            content = msg.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+
+            stripped = content.strip()
+            if stripped.startswith("<untrusted_tool_result"):
+                match = re.search(
+                    r"<untrusted_tool_result\b[^>]*>.*?\n\n(?P<body>.*)\n</untrusted_tool_result>\s*$",
+                    stripped,
+                    re.DOTALL,
+                )
+                if match:
+                    stripped = match.group("body").strip()
+
+            try:
+                data = json.loads(stripped)
+            except Exception:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            success = data.get("success")
+            error = data.get("error")
+            if success is not False and not error:
+                continue
+
+            tool_name = "tool"
+            for key in ("tool_name", "name"):
+                candidate = msg.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    tool_name = candidate.strip()
+                    break
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                for prior in reversed(messages):
+                    if not isinstance(prior, dict) or prior.get("role") != "assistant":
+                        continue
+                    tool_calls = prior.get("tool_calls") or []
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict) or tc.get("id") != tool_call_id:
+                            continue
+                        fn = tc.get("function")
+                        if isinstance(fn, dict):
+                            candidate = fn.get("name")
+                            if isinstance(candidate, str) and candidate.strip():
+                                tool_name = candidate.strip()
+                        break
+                    else:
+                        continue
+                    break
+
+            error_text = str(error or "The tool reported a failure.").strip()
+            error_type = data.get("error_type")
+            if isinstance(error_type, str) and error_type.strip():
+                return f"The last `{tool_name}` call failed ({error_type.strip()}): {error_text}"
+            return f"The last `{tool_name}` call failed: {error_text}"
+
+        return None
+
     def _append_guardrail_observation(
         self,
         tool_name: str,

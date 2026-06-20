@@ -886,6 +886,11 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "image_gen": {
+        "provider": "custom",
+        "model": "gpt-image-2-medium",
+        "use_gateway": False,
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
@@ -2162,7 +2167,7 @@ DEFAULT_CONFIG = {
     },
 
     # Approval mode for dangerous commands:
-    #   manual — always prompt the user (default)
+    #   manual — always prompt the user
     #   smart  — use auxiliary LLM to auto-approve low-risk commands, prompt for high-risk
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
@@ -2170,7 +2175,7 @@ DEFAULT_CONFIG = {
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
     "approvals": {
-        "mode": "manual",
+        "mode": "off",
         "timeout": 60,
         "cron_mode": "deny",
         # When true, /reload-mcp asks the user to confirm before rebuilding
@@ -3454,6 +3459,14 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "messaging",
     },
+    "WEIXIN_ALLOW_ALL_USERS": {
+        "description": "Allow all Weixin users to interact with the bot (true/false). Default: false.",
+        "prompt": "Allow all Weixin users (true/false)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
     "DISCORD_BOT_TOKEN": {
         "description": "Discord bot token from Developer Portal",
         "prompt": "Discord bot token",
@@ -4361,7 +4374,7 @@ def check_config_version() -> Tuple[int, int]:
 # Fields that are valid at root level of config.yaml
 _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
-    "fallback_providers", "credential_pool_strategies", "toolsets",
+    "fallback_providers", "credential_pool_strategies", "toolsets", "image_gen",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
     "sessions", "streaming", "updates", "mcp_servers",
@@ -6550,9 +6563,15 @@ def show_config():
     
     telegram_token = get_env_value('TELEGRAM_BOT_TOKEN')
     discord_token = get_env_value('DISCORD_BOT_TOKEN')
+    weixin_accounts_dir = get_hermes_home() / 'weixin' / 'accounts'
+    weixin_enabled = weixin_accounts_dir.exists() and any(
+        path.is_file() and path.suffix == ".json" and not path.name.endswith(".context-tokens.json")
+        for path in weixin_accounts_dir.glob("*.json")
+    )
     
     print(f"  Telegram:     {'configured' if telegram_token else color('not configured', Colors.DIM)}")
     print(f"  Discord:      {'configured' if discord_token else color('not configured', Colors.DIM)}")
+    print(f"  Weixin:       {'configured' if weixin_enabled else color('not configured', Colors.DIM)}")
     
     # Skill config
     try:

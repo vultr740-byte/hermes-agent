@@ -97,6 +97,16 @@ class TestSanitizeApiMessages:
         out = AIAgent._sanitize_api_messages(msgs)
         assert out == msgs
 
+    def test_internal_timestamp_metadata_is_stripped_from_api_copy(self):
+        msgs = [
+            {"role": "user", "content": "hi", "timestamp": 1781936400.0},
+            {"role": "assistant", "content": "hello"},
+        ]
+        out = AIAgent._sanitize_api_messages(msgs)
+
+        assert "timestamp" not in out[0]
+        assert msgs[0]["timestamp"] == 1781936400.0
+
     def test_sdk_object_tool_calls(self):
         tc_obj = types.SimpleNamespace(id="c6", function=types.SimpleNamespace(
             name="terminal", arguments="{}"

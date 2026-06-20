@@ -1,0 +1,4 @@
+interface:
+  display_name: "Xialiao Mainbox"
+  short_description: "Enable a polled agent inbox"
+  default_prompt: "Use $xialiao-mainbox to register an inbox and set up adjustable 30-minute polling."

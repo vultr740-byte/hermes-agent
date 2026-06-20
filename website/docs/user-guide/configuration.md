@@ -1788,7 +1788,7 @@ Control how Hermes handles potentially dangerous commands:
 
 ```yaml
 approvals:
-  mode: manual   # manual | smart | off
+  mode: off      # manual | smart | off
 ```
 
 | Mode | Behavior |

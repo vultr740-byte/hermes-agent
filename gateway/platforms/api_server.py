@@ -741,6 +741,19 @@ except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
 
+def _weixin_account_payload() -> Dict[str, Any]:
+    from gateway.platforms.weixin import load_weixin_account_state
+
+    state = load_weixin_account_state() or {}
+    return {
+        "connected": bool(state.get("bot_token")),
+        "account_id": state.get("account_id") or "",
+        "base_url": state.get("base_url") or "",
+        "user_id": state.get("user_id") or "",
+        "updated_at": state.get("updated_at"),
+    }
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -782,6 +795,53 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self.gateway_runner = None
+
+    async def _complete_weixin_login_in_background(self, session_key: str) -> None:
+        """Wait for QR confirmation, persist credentials, and reconnect Weixin."""
+        try:
+            from gateway.platforms.weixin import (
+                save_weixin_account_state,
+                wait_for_weixin_login,
+            )
+
+            result = await asyncio.to_thread(
+                wait_for_weixin_login,
+                session_key=session_key,
+                timeout_ms=480_000,
+            )
+            if not result.get("connected"):
+                logger.info(
+                    "[api_server] Weixin QR session %s did not complete: %s",
+                    session_key,
+                    result.get("message"),
+                )
+                return
+
+            save_weixin_account_state(
+                {
+                    "account_id": result.get("account_id"),
+                    "bot_token": result.get("bot_token"),
+                    "base_url": result.get("base_url"),
+                    "user_id": result.get("user_id"),
+                    "updated_at": int(time.time()),
+                }
+            )
+
+            if self.gateway_runner is not None:
+                try:
+                    await self.gateway_runner.reconnect_platform(Platform.WEIXIN)
+                except Exception:
+                    logger.warning(
+                        "[api_server] Failed reconnecting Weixin after QR login",
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.warning(
+                "[api_server] Background Weixin QR completion failed for %s",
+                session_key,
+                exc_info=True,
+            )
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1216,8 +1276,99 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "weixin_account": {"method": "GET", "path": "/api/weixin/account"},
+                "weixin_login_start": {"method": "POST", "path": "/api/weixin/login/start"},
+                "weixin_login_status": {"method": "GET", "path": "/api/weixin/login/status"},
             },
         })
+
+    async def _handle_weixin_login_start(self, request: "web.Request") -> "web.Response":
+        """POST /api/weixin/login/start — generate a QR code for remote pairing."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except (json.JSONDecodeError, Exception):
+            body = {}
+
+        from gateway.platforms.weixin import start_weixin_qr_login
+
+        start_kwargs = {
+            "force": bool(body.get("force", False)),
+            "account_id": str(body.get("account_id") or "").strip() or None,
+        }
+        api_base_url = str(body.get("api_base_url") or "").strip()
+        if api_base_url:
+            start_kwargs["api_base_url"] = api_base_url
+
+        result = await asyncio.to_thread(start_weixin_qr_login, **start_kwargs)
+        session_key = str(result.get("session_key") or "").strip()
+        if session_key:
+            task = asyncio.create_task(
+                self._complete_weixin_login_in_background(session_key)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        status = 200 if result.get("qr_url") and result.get("session_key") else 500
+        return web.json_response(result, status=status)
+
+    async def _handle_weixin_login_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/weixin/login/status — poll the QR login state and persist credentials."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_key = str(request.query.get("session_key") or "").strip()
+        if not session_key:
+            return web.json_response({"error": "Missing session_key"}, status=400)
+
+        timeout_ms_raw = str(request.query.get("timeout_ms") or "35000").strip()
+        try:
+            timeout_ms = max(int(timeout_ms_raw), 1000)
+        except ValueError:
+            return web.json_response({"error": "Invalid timeout_ms"}, status=400)
+
+        from gateway.platforms.weixin import (
+            check_weixin_login_status,
+            save_weixin_account_state,
+        )
+
+        result = await asyncio.to_thread(
+            check_weixin_login_status,
+            session_key=session_key,
+            timeout_ms=timeout_ms,
+        )
+        if result.get("connected"):
+            save_weixin_account_state(
+                {
+                    "account_id": result.get("account_id"),
+                    "bot_token": result.get("bot_token"),
+                    "base_url": result.get("base_url"),
+                    "user_id": result.get("user_id"),
+                    "updated_at": int(time.time()),
+                }
+            )
+            if self.gateway_runner is not None:
+                try:
+                    await self.gateway_runner.reconnect_platform(Platform.WEIXIN)
+                except Exception:
+                    logger.warning(
+                        "[api_server] Failed reconnecting Weixin after status confirmation",
+                        exc_info=True,
+                    )
+        payload = {**result, "account": _weixin_account_payload()}
+        status = 200 if "message" in result or result.get("connected") else 500
+        return web.json_response(payload, status=status)
+
+    async def _handle_weixin_account(self, request: "web.Request") -> "web.Response":
+        """GET /api/weixin/account — inspect persisted Weixin login state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        return web.json_response(_weixin_account_payload())
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -4262,6 +4413,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
+            self._app.router.add_get("/api/weixin/account", self._handle_weixin_account)
+            self._app.router.add_post("/api/weixin/login/start", self._handle_weixin_login_start)
+            self._app.router.add_get("/api/weixin/login/status", self._handle_weixin_login_status)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

@@ -2300,6 +2300,59 @@ def _normalize_empty_agent_response(
     return response
 
 
+def _gateway_billing_failure_messages(agent_result: dict) -> Optional[List[str]]:
+    """Return user-facing billing exhaustion copy for failed agent results."""
+    if not isinstance(agent_result, dict):
+        return None
+    if not (
+        agent_result.get("failed")
+        or agent_result.get("error")
+        or agent_result.get("failure_reason") == "billing"
+    ):
+        return None
+    error_details = [
+        agent_result.get("error"),
+        agent_result.get("final_response"),
+    ]
+    if agent_result.get("failure_reason") == "billing":
+        error_details.append("HTTP 402: billing or credits exhausted")
+    if not any(error_details):
+        return None
+    try:
+        from agent.billing_ui import format_billing_failure_response
+
+        billing = None
+        for error_detail in error_details:
+            if not error_detail:
+                continue
+            billing = format_billing_failure_response(error_detail)
+            if billing is not None:
+                break
+    except Exception:
+        logger.debug("Billing failure formatting failed", exc_info=True)
+        return None
+    if billing is None:
+        return None
+    return billing.as_messages()
+
+
+def _media_tags_as_final_response(
+    media_tags: List[str],
+    has_voice_directive: bool,
+) -> str:
+    """Render collected MEDIA tags as a gateway final response."""
+    seen = set()
+    unique_tags = []
+    for tag in media_tags:
+        if tag in seen:
+            continue
+        seen.add(tag)
+        unique_tags.append(tag)
+    if has_voice_directive:
+        unique_tags.insert(0, "[[audio_as_voice]]")
+    return "\n".join(unique_tags)
+
+
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """Return True only when a gateway turn really completed successfully.
 
@@ -5309,15 +5362,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _any_allowlist = any(
             os.getenv(v) for v in _builtin_allowed_vars + _plugin_allowed_vars
         )
-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"} or any(
+        gateway_allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower()
+        _allow_all = gateway_allow_all not in {"false", "0", "no", "off"} or any(
             os.getenv(v, "").lower() in {"true", "1", "yes"}
             for v in _builtin_allow_all_vars + _plugin_allow_all_vars
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
-                "No user allowlists configured. All unauthorized users will be denied. "
-                "Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access, "
-                "or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id)."
+                "No user allowlists configured and GATEWAY_ALLOW_ALL_USERS=false. "
+                "Unauthorized DMs will use the pairing flow or be denied by platform policy. "
+                "Configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id) "
+                "or unset GATEWAY_ALLOW_ALL_USERS to use the gateway branch default-open policy."
             )
         
         # Discover Python plugins before shell hooks so plugin block
@@ -6943,6 +6998,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import hashlib
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
+    async def reconnect_platform(self, platform: Platform) -> bool:
+        """Attempt to connect a single platform immediately.
+
+        Used by runtime workflows that satisfy missing prerequisites after
+        startup, such as remote Weixin QR login storing fresh credentials.
+        """
+        platform_config = self.config.platforms.get(platform)
+        if not platform_config or not platform_config.enabled:
+            return False
+
+        existing = self.adapters.get(platform)
+        if existing:
+            try:
+                await existing.disconnect()
+            except Exception:
+                logger.debug(
+                    "Failed disconnecting existing %s adapter before reconnect",
+                    platform.value,
+                    exc_info=True,
+                )
+            self.adapters.pop(platform, None)
+
+        adapter = self._create_adapter(platform, platform_config)
+        if not adapter:
+            return False
+
+        adapter.set_message_handler(self._handle_message)
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+        adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+        adapter._busy_text_mode = self._busy_text_mode
+
+        success = await self._connect_adapter_with_timeout(adapter, platform)
+        if success:
+            self.adapters[platform] = adapter
+            self._sync_voice_mode_state_to_adapter(adapter)
+            self.delivery_router.adapters = self.adapters
+            self._failed_platforms.pop(platform, None)
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="connected",
+                error_code=None,
+                error_message=None,
+            )
+            try:
+                from gateway.channel_directory import build_channel_directory
+
+                await build_channel_directory(self.adapters)
+            except Exception:
+                pass
+            try:
+                self._schedule_resume_pending_sessions(platform=platform)
+            except Exception:
+                logger.debug(
+                    "resume-pending reschedule after explicit %s reconnect failed",
+                    platform.value,
+                    exc_info=True,
+                )
+            logger.info("✓ %s connected via explicit reconnect", platform.value)
+            return True
+
+        self._update_platform_runtime_status(
+            platform.value,
+            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+            error_code=adapter.fatal_error_code,
+            error_message=adapter.fatal_error_message or "failed to reconnect",
+        )
+        if adapter.has_fatal_error and adapter.fatal_error_retryable:
+            self._failed_platforms[platform] = {
+                "config": platform_config,
+                "attempts": 0,
+                "next_retry": time.monotonic() + 5,
+            }
+        await _dispose_unused_adapter(adapter)
+        return False
+
     def _create_adapter(
         self, 
         platform: Platform, 
@@ -7114,7 +7246,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            return APIServerAdapter(config)
+            adapter = APIServerAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
@@ -9344,7 +9478,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
-            if not os.getenv(env_key):
+            if (
+                source.platform == Platform.WEIXIN
+                and getattr(source, "chat_type", None) == "dm"
+                and getattr(source, "chat_id", None)
+                and not os.getenv(env_key)
+                and self.config.get_home_channel(source.platform) is None
+            ):
+                try:
+                    from hermes_cli.config import save_env_value
+
+                    save_env_value(env_key, str(source.chat_id))
+                    save_env_value(
+                        _home_thread_env_var(platform_name),
+                        str(getattr(source, "thread_id", None) or ""),
+                    )
+                    name_key = f"{platform_name.upper()}_HOME_CHANNEL_NAME"
+                    if getattr(source, "chat_name", None):
+                        save_env_value(name_key, str(source.chat_name))
+                    try:
+                        import yaml
+                        from utils import atomic_yaml_write
+
+                        config_path = _hermes_home / "config.yaml"
+                        raw_config: dict = {}
+                        if config_path.exists():
+                            with config_path.open(encoding="utf-8") as f:
+                                raw_config = yaml.safe_load(f) or {}
+                        if not isinstance(raw_config, dict):
+                            raw_config = {}
+                        raw_config[env_key] = str(source.chat_id)
+                        if getattr(source, "chat_name", None):
+                            raw_config[name_key] = str(source.chat_name)
+                        atomic_yaml_write(config_path, raw_config, sort_keys=False)
+                    except Exception:
+                        logger.debug(
+                            "Failed to persist Weixin auto home to config.yaml",
+                            exc_info=True,
+                        )
+                    platform_config = self.config.platforms.setdefault(
+                        source.platform,
+                        PlatformConfig(enabled=True),
+                    )
+                    platform_config.home_channel = HomeChannel(
+                        platform=source.platform,
+                        chat_id=str(source.chat_id),
+                        name=source.chat_name or str(source.chat_id),
+                        thread_id=(
+                            str(source.thread_id)
+                            if getattr(source, "thread_id", None)
+                            else None
+                        ),
+                    )
+                    logger.info(
+                        "Auto-set Weixin home channel to first DM chat %s",
+                        source.chat_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to auto-set Weixin home channel",
+                        exc_info=True,
+                    )
+            elif not os.getenv(env_key):
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".
@@ -9492,7 +9687,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
-            response = agent_result.get("final_response") or ""
+            _billing_response_messages = _gateway_billing_failure_messages(agent_result)
+            response = (
+                _billing_response_messages[0]
+                if _billing_response_messages
+                else agent_result.get("final_response") or ""
+            )
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -9556,7 +9756,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
-            if not _intentional_silence:
+            if _billing_response_messages:
+                response = _billing_response_messages[0]
+            elif not _intentional_silence:
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
@@ -9591,7 +9793,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
-            if _show_reasoning_effective and response and not _intentional_silence:
+            if (
+                _show_reasoning_effective
+                and response
+                and not _intentional_silence
+                and not _billing_response_messages
+            ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -9621,7 +9828,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            if (
+                _footer_line
+                and response
+                and not agent_result.get("already_sent")
+                and not _intentional_silence
+                and not _billing_response_messages
+            ):
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
@@ -9892,7 +10105,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            if (
+                not _billing_response_messages
+                and self._should_send_voice_reply(
+                    event,
+                    response,
+                    agent_messages,
+                    already_sent=_already_sent,
+                )
+            ):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -9930,7 +10151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
-            return response
+            return _billing_response_messages or response
             
         except Exception as e:
             # Stop typing indicator on error too
@@ -11127,6 +11348,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
+
+            _billing_response_messages = _gateway_billing_failure_messages(result or {})
+            if _billing_response_messages:
+                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + _billing_response_messages[0],
+                    metadata=_thread_metadata,
+                )
+                for _billing_extra in _billing_response_messages[1:]:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=_billing_extra,
+                        metadata=_thread_metadata,
+                    )
+                return
 
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
@@ -15934,6 +16172,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effective_session_id = agent_session_id
             _effective_history_offset = 0 if _session_was_split else len(agent_history)
 
+            if "MEDIA:" not in (final_response or ""):
+                media_tags, has_voice_directive = _collect_auto_append_media_tags(
+                    result.get("messages", []),
+                    history_offset=_effective_history_offset,
+                    history_media_paths=_history_media_paths,
+                )
+                if media_tags:
+                    media_response = _media_tags_as_final_response(
+                        media_tags,
+                        has_voice_directive,
+                    )
+                    if final_response:
+                        final_response = final_response + "\n" + media_response
+                    else:
+                        final_response = media_response
+
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
@@ -15980,20 +16234,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
-                    history_offset=len(agent_history),
+                    history_offset=_effective_history_offset,
                     history_media_paths=_history_media_paths,
                 )
 
                 if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
+                    media_response = _media_tags_as_final_response(
+                        media_tags,
+                        has_voice_directive,
+                    )
+                    final_response = final_response + "\n" + media_response
             
             # Auto-generate session title after first exchange (non-blocking)
             if final_response and self._session_db:

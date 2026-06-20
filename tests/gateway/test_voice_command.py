@@ -286,6 +286,19 @@ class TestAutoVoiceReply:
     def runner(self, tmp_path):
         return _make_runner(tmp_path)
 
+    def test_gateway_response_list_stringifies_for_tts(self):
+        from gateway.run import _stringify_gateway_response
+
+        response = [
+            "⚠️ 模型余额不足，请充值后重试。",
+            "https://www.xialiao.app/recharge/abc",
+        ]
+
+        assert _stringify_gateway_response(response) == (
+            "⚠️ 模型余额不足，请充值后重试。\n"
+            "https://www.xialiao.app/recharge/abc"
+        )
+
     def _call(self, runner, voice_mode, message_type, agent_messages=None,
               response="Hello!", in_voice_channel=False):
         """Call real _should_send_voice_reply on a GatewayRunner instance."""

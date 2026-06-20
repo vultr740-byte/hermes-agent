@@ -1405,10 +1405,11 @@ def check_all_command_guards(command: str, env_type: str,
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    # --yolo bypasses all approval prompts. Gateway /yolo is session-scoped;
+    # CLI --yolo remains process-scoped. approvals.mode=off is handled later
+    # so non-interactive cron sessions can still honor approvals.cron_mode.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -1422,21 +1423,27 @@ def check_all_command_guards(command: str, env_type: str,
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
-            if _get_cron_approval_mode() == "deny":
-                # Run detection to get a description for the block message
-                is_dangerous, _pk, description = detect_dangerous_command(command)
-                if is_dangerous:
-                    return {
-                        "approved": False,
-                        "message": (
-                            f"BLOCKED: Command flagged as dangerous ({description}) "
-                            "but cron jobs run without a user present to approve it. "
-                            "Find an alternative approach that avoids this command. "
-                            "To allow dangerous commands in cron jobs, set "
-                            "approvals.cron_mode: approve in config.yaml."
-                        ),
-                    }
+        if env_var_enabled("HERMES_CRON_SESSION") and _get_cron_approval_mode() == "deny":
+            # Run detection to get a description for the block message.
+            # This deny rule intentionally wins over approvals.mode=off.
+            is_dangerous, _pk, description = detect_dangerous_command(command)
+            if is_dangerous:
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: Command flagged as dangerous ({description}) "
+                        "but cron jobs run without a user present to approve it. "
+                        "Find an alternative approach that avoids this command. "
+                        "To allow dangerous commands in cron jobs, set "
+                        "approvals.cron_mode: approve in config.yaml."
+                    ),
+                }
+        return {"approved": True, "message": None}
+
+    # Interactive / gateway approval flow: approvals.mode=off suppresses
+    # prompts here, but cron sessions above still respect approvals.cron_mode.
+    approval_mode = _get_approval_mode()
+    if approval_mode == "off":
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---

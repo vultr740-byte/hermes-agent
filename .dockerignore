@@ -3,6 +3,11 @@
 .gitignore
 .gitmodules
 
+# Local artifacts
+.local
+.plans
+plans
+
 # Python
 __pycache__
 *.py[cod]
@@ -37,6 +42,16 @@ ui-tui/packages/hermes-ink/dist/
 # CI/CD
 .github
 
+# Non-runtime project content
+tests
+website
+landingpage
+docs
+assets
+datagen-config-examples
+nix
+tinker-atropos
+
 # Environment files
 .env
 .env.*
@@ -52,8 +67,13 @@ ui-tui/packages/hermes-ink/dist/
 .coverage
 htmlcov/
 
-# Documentation
-*.md
+# Exclude markdown by default, then include the runtime markdown files the
+# package and bundled skills need inside the image.
+**/*.md
+!README.md
+!docker/SOUL.md
+!skills/**/*.md
+!optional-skills/**/*.md
 
 # Runtime data (bind-mounted at /opt/data; must not leak into build context)
 data/
@@ -97,8 +117,10 @@ plans/
 acp_registry/
 
 # Repo-level dotfiles that are git-only or dev-tooling config
-.env.example
 .envrc
 .gitattributes
 .hadolint.yaml
 .mailmap
+
+# Runtime bootstrap files required by Docker entrypoint
+!.env.example

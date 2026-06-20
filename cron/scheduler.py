@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -168,7 +169,7 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
-    "telegram", "discord", "slack", "whatsapp", "signal",
+    "telegram", "discord", "slack", "whatsapp", "weixin", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot", "yuanbao",
@@ -287,6 +288,108 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
+
+
+@contextmanager
+def _job_profile_context(job_id: str, profile: Optional[str]):
+    """Temporarily run a job under a specific Hermes profile.
+
+    Cron jobs are stored and scheduled by the profile running the scheduler, but
+    an individual job can opt into a different runtime profile. While active,
+    the scheduler's test/override hook and a context-local Hermes home override
+    both point at the resolved profile directory so _get_hermes_home(),
+    .env/config loading, script resolution, AIAgent construction, and downstream
+    get_hermes_home() callers agree on the same home.
+
+    Some existing provider/config paths still load profile .env values through
+    os.environ, so profile jobs also snapshot and restore the process
+    environment on exit. tick() runs profile jobs sequentially to keep that
+    temporary mutation isolated from other scheduled jobs.
+    """
+    raw_profile = str(profile or "").strip()
+    if not raw_profile:
+        yield None
+        return
+
+    global _hermes_home
+    prior_override = _hermes_home
+    env_snapshot = os.environ.copy()
+
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    normalized_profile = normalize_profile_name(raw_profile)
+    try:
+        profile_home = Path(resolve_profile_env(normalized_profile)).resolve()
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning(
+            "Job '%s': configured profile %r no longer valid (%s) — "
+            "falling back to scheduler default",
+            job_id, raw_profile, exc,
+        )
+        yield None
+        return
+
+    override_token = None
+    try:
+        override_token = set_hermes_home_override(profile_home)
+        _hermes_home = profile_home
+        logger.info(
+            "Job '%s': using Hermes profile '%s' (%s)",
+            job_id,
+            normalized_profile,
+            profile_home,
+        )
+        yield normalized_profile
+    finally:
+        _hermes_home = prior_override
+        if override_token is not None:
+            reset_hermes_home_override(override_token)
+        # Delta-based restore: remove added keys, restore changed keys.
+        # Avoids a brief window where other threads see an empty env.
+        added = set(os.environ.keys()) - set(env_snapshot.keys())
+        for k in added:
+            os.environ.pop(k, None)
+        for k, v in env_snapshot.items():
+            if os.environ.get(k) != v:
+                os.environ[k] = v
+
+
+def _home_channel_target(
+    config,
+    platform_name: str,
+    *,
+    allow_env_fallback: bool = True,
+) -> Optional[dict]:
+    """Resolve a platform's home channel from gateway config or env."""
+    platform_key = platform_name.lower()
+    try:
+        from gateway.config import Platform
+
+        platform = Platform(platform_key)
+    except ValueError:
+        platform = None
+
+    if platform is not None and config is not None:
+        home = config.get_home_channel(platform)
+        if home and str(home.chat_id or "").strip():
+            return {
+                "platform": platform.value,
+                "chat_id": str(home.chat_id),
+                "thread_id": getattr(home, "thread_id", None),
+            }
+
+    if not allow_env_fallback:
+        return None
+
+    chat_id = _get_home_target_chat_id(platform_key)
+    if not chat_id:
+        return None
+    return {
+        "platform": platform.value if platform is not None else platform_key,
+        "chat_id": chat_id,
+        "thread_id": _get_home_target_thread_id(platform_key),
+    }
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -480,11 +583,16 @@ def cron_delivery_targets() -> list[dict]:
 
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
-
     origin = _resolve_origin(job)
 
     if deliver_value == "local":
         return None
+
+    try:
+        from gateway.config import load_gateway_config as _load_gateway_config
+        config = _load_gateway_config()
+    except Exception:
+        config = None
 
     if deliver_value == "origin":
         if origin:
@@ -493,21 +601,33 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": origin.get("thread_id"),
             }
-        # Origin missing (e.g. job created via API/script) — try each
-        # platform's home channel as a fallback instead of silently dropping.
+        # Origin missing (e.g. job created via API/script) — first prefer
+        # explicit gateway-configured home channels, then fall back to raw env
+        # vars so unrelated test/runtime env does not override a real config.
         for platform_name in _iter_home_target_platforms():
-            chat_id = _get_home_target_chat_id(platform_name)
-            if chat_id:
+            target = _home_channel_target(
+                config,
+                platform_name,
+                allow_env_fallback=False,
+            )
+            if target:
                 logger.info(
                     "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
                     job.get("name", job.get("id", "?")),
                     platform_name,
                 )
-                return {
-                    "platform": platform_name,
-                    "chat_id": chat_id,
-                    "thread_id": _get_home_target_thread_id(platform_name),
-                }
+                return target
+        # If no explicit config exists, keep the legacy env-based fallback
+        # instead of silently dropping delivery.
+        for platform_name in _iter_home_target_platforms():
+            target = _home_channel_target(config, platform_name)
+            if target:
+                logger.info(
+                    "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
+                    job.get("name", job.get("id", "?")),
+                    platform_name,
+                )
+                return target
         return None
 
     if ":" in deliver_value:
@@ -553,6 +673,9 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if not _is_known_delivery_platform(platform_name):
         return None
+    target = _home_channel_target(config, platform_name)
+    if target:
+        return target
     chat_id = _get_home_target_chat_id(platform_name)
     if not chat_id:
         return None
@@ -731,7 +854,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
-
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
