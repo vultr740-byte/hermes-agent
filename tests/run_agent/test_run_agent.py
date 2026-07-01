@@ -1387,6 +1387,12 @@ class TestTaskCompletionGuidance:
             a.client = MagicMock()
             return a
 
+    def test_disk_protection_guidance_is_in_stable_prompt(self):
+        from agent.prompt_builder import DISK_PROTECTION_GUIDANCE
+        agent = self._make_agent(model="anthropic/claude-opus-4.8")
+        prompt = agent._build_system_prompt()
+        assert DISK_PROTECTION_GUIDANCE in prompt
+
     def test_default_injects_for_claude(self):
         """The block must reach Claude by default — that's the
         primary motivating model family."""

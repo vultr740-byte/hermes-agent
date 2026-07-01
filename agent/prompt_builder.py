@@ -305,6 +305,16 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+DISK_PROTECTION_GUIDANCE = (
+    "# Disk protection\n"
+    "Before installing, downloading, extracting, generating large files, creating "
+    "virtual environments, or running operations that may create caches, check "
+    "free space on the relevant mount points and keep enough space available in "
+    "the workspace and persistent directories. Put large temporary files in a "
+    "temp directory on a mount with enough free space, and remove temporary "
+    "files that are no longer needed."
+)
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire

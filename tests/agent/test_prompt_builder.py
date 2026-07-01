@@ -27,6 +27,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    DISK_PROTECTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
@@ -1499,6 +1500,40 @@ class TestOpenAIModelExecutionGuidance:
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
 
 
+class TestDiskProtectionGuidance:
+    """Behavior contracts for the global disk-protection guidance block."""
+
+    def test_is_nonempty_english_section(self):
+        assert isinstance(DISK_PROTECTION_GUIDANCE, str)
+        assert DISK_PROTECTION_GUIDANCE.lstrip().startswith("#")
+        assert "Before" in DISK_PROTECTION_GUIDANCE
+
+    def test_requires_space_check_before_heavy_writes(self):
+        text = DISK_PROTECTION_GUIDANCE.lower()
+        assert "before" in text
+        assert "free space" in text
+        assert "mount" in text
+        assert "installing" in text
+        assert "downloading" in text
+        assert "virtual environments" in text
+        assert "caches" in text
+
+    def test_puts_large_temp_files_on_spacious_temp_mount(self):
+        text = DISK_PROTECTION_GUIDANCE.lower()
+        assert "large temporary files" in text
+        assert "temp directory" in text
+        assert "enough free space" in text
+
+    def test_cleanup_is_limited_to_unneeded_temporary_files(self):
+        text = DISK_PROTECTION_GUIDANCE.lower()
+        assert "remove temporary files" in text
+        assert "no longer needed" in text
+        assert "report" not in text
+
+    def test_stays_short_for_cached_prompt(self):
+        assert len(DISK_PROTECTION_GUIDANCE) < 650
+
+
 class TestParallelToolCallGuidance:
     """Behavior contracts for the universal parallel-tool-call guidance block.
 
@@ -1545,5 +1580,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
